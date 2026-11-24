@@ -147,23 +147,11 @@ namespace RevitLocationExporter
             AddButtonIfMissing(Button<Commands.LocationExporterCommand>(
                 "LocationExporterCommand", "Location\nExporter", "LocationExporter"));
 
-            // 2. Central Model Location Splitter
-            AddButtonIfMissing(Button<Commands.LocationSplitterCentral>(
-                "LocationSplitter", "Location\nSplitter", "LocationSplitter"));
-
-            // 3. Batch CPK Updater
-            AddButtonIfMissing(Button<Commands.BatchCpkUpdaterCommand>(
-                "BatchCPK", "Batch CPK\nUpdater", "BatchCPK"));
-
-            // 4. Batch Coordinate Manager
-            AddButtonIfMissing(Button<Commands.BatchCoordinateManagerCommand>(
-                "BatchCoordinateManager", "Batch Coordinate\nManager", "BatchCoordinateManager"));
-
-            // 5. Delete Locations Tool
+            // 2. Delete Locations Tool
             AddButtonIfMissing(Button<Commands.DeleteProjectLocations>(
                 "DeleteLocations", "Delete Locations", "DeleteLocations"));
 
-            // 6. Trade Profiles Manager & Builder
+            // 3. Trade Profiles Manager & Builder
             AddButtonIfMissing(Button<Commands.TradeProfileManagerCommand>(
                 "TradeProfileManager", "Trade\nProfiles", "TradeProfiles"));
         }
