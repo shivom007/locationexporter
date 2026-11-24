@@ -37,7 +37,7 @@ namespace RevitLocationExporter.Core
             {
                 var cells = new List<string>(lastCol);
                 for (int c = 1; c <= lastCol; c++)
-                    cells.Add(ws.Cell(r, c).GetFormattedString() ?? "");
+                    cells.Add(LocationDataSheetReader.ReadCellTextSafe(ws.Cell(r, c)));
                 table.Add(cells);
             }
             return StandardsFillReader.FromTable(table[0], table.Skip(1));

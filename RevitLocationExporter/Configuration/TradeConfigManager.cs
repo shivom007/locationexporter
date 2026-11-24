@@ -5,6 +5,7 @@ using System.Linq;
 using System.Reflection;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace RevitLocationExporter.Configuration
 {
@@ -27,10 +28,28 @@ namespace RevitLocationExporter.Configuration
         /// <summary>The currently active/selected trade code (e.g. "TI0", "ME0", "EL0").</summary>
         public string ActiveTradeCode { get; set; } = "TI0";
 
+        private static JsonSerializerOptions CreateJsonOptions()
+        {
+            var opts = new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true,
+                WriteIndented = true,
+                Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+            };
+            opts.Converters.Add(new JsonStringEnumConverter());
+            return opts;
+        }
+
         public TradeConfigManager()
         {
             RegisterBuiltInTrades();
             TryLoadFromJson();
+        }
+
+        /// <summary>Restores built-in default trade profiles (preserving any extra custom trades).</summary>
+        public void ResetBuiltInTrades()
+        {
+            RegisterBuiltInTrades();
         }
 
         private void RegisterBuiltInTrades()
@@ -191,18 +210,20 @@ namespace RevitLocationExporter.Configuration
                     using JsonDocument doc = JsonDocument.Parse(json);
                     JsonElement root = doc.RootElement;
 
+                    var jsonOpts = CreateJsonOptions();
+
                     if (root.TryGetProperty("Trades", out JsonElement tradesElement))
                     {
                         foreach (JsonProperty tradeProp in tradesElement.EnumerateObject())
                         {
-                            var profile = JsonSerializer.Deserialize<TradeProfile>(tradeProp.Value.GetRawText(),
-                                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                            var profile = JsonSerializer.Deserialize<TradeProfile>(tradeProp.Value.GetRawText(), jsonOpts);
 
                             if (profile != null)
                             {
                                 if (string.IsNullOrWhiteSpace(profile.TradeCode))
                                     profile.TradeCode = tradeProp.Name;
 
+                                profile.EnsureInitialized();
                                 Trades[profile.TradeCode] = profile;
                             }
                         }
@@ -250,13 +271,7 @@ namespace RevitLocationExporter.Configuration
                 Trades = Trades
             };
 
-            var options = new JsonSerializerOptions
-            {
-                WriteIndented = true,
-                Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
-            };
-
-            string json = JsonSerializer.Serialize(rootObj, options);
+            string json = JsonSerializer.Serialize(rootObj, CreateJsonOptions());
             File.WriteAllText(filePath, json);
         }
 
@@ -268,13 +283,7 @@ namespace RevitLocationExporter.Configuration
             if (string.IsNullOrWhiteSpace(tradeCode) || !Trades.TryGetValue(tradeCode, out var profile))
                 throw new ArgumentException($"Trade profile '{tradeCode}' not found.");
 
-            var options = new JsonSerializerOptions
-            {
-                WriteIndented = true,
-                Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
-            };
-
-            string json = JsonSerializer.Serialize(profile, options);
+            string json = JsonSerializer.Serialize(profile, CreateJsonOptions());
             File.WriteAllText(filePath, json);
         }
 
@@ -296,14 +305,14 @@ namespace RevitLocationExporter.Configuration
                 string json = File.ReadAllText(filePath);
                 using JsonDocument doc = JsonDocument.Parse(json);
                 JsonElement root = doc.RootElement;
+                var jsonOpts = CreateJsonOptions();
 
                 // Case 1: Multi-trade config format
                 if (root.TryGetProperty("Trades", out JsonElement tradesElement))
                 {
                     foreach (JsonProperty tradeProp in tradesElement.EnumerateObject())
                     {
-                        var profile = JsonSerializer.Deserialize<TradeProfile>(tradeProp.Value.GetRawText(),
-                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                        var profile = JsonSerializer.Deserialize<TradeProfile>(tradeProp.Value.GetRawText(), jsonOpts);
 
                         if (profile != null)
                         {
@@ -326,8 +335,7 @@ namespace RevitLocationExporter.Configuration
                 }
 
                 // Case 2: Single TradeProfile format
-                var singleProfile = JsonSerializer.Deserialize<TradeProfile>(json,
-                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                var singleProfile = JsonSerializer.Deserialize<TradeProfile>(json, jsonOpts);
 
                 if (singleProfile != null && !string.IsNullOrWhiteSpace(singleProfile.TradeCode))
                 {
@@ -356,6 +364,7 @@ namespace RevitLocationExporter.Configuration
                 throw new ArgumentException("TradeCode cannot be empty.");
 
             profile.TradeCode = profile.TradeCode.Trim().ToUpperInvariant();
+            profile.EnsureInitialized();
             profile.InvalidateFilter();
             Trades[profile.TradeCode] = profile;
         }

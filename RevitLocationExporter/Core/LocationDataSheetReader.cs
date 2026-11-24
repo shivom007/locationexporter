@@ -793,11 +793,13 @@
 using ClosedXML.Excel;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
 namespace RevitLocationExporter.Core
@@ -977,13 +979,21 @@ namespace RevitLocationExporter.Core
 
         #region Tab / header detection helpers
 
+        internal static bool IsProfileMetaTab(string tabName) =>
+            tabName.Equals("Trade_Config", StringComparison.OrdinalIgnoreCase) ||
+            tabName.Equals("TradeConfig", StringComparison.OrdinalIgnoreCase) ||
+            tabName.Equals("Parameter_Rules", StringComparison.OrdinalIgnoreCase) ||
+            tabName.Equals("ParameterRules", StringComparison.OrdinalIgnoreCase);
+
         private static bool IsSheetSpecificTab(string tabName) =>
+            !IsProfileMetaTab(tabName) &&
             !StandardsFillWorkbookReader.IsStandardsTab(tabName) && (
             tabName.IndexOf("specific", StringComparison.OrdinalIgnoreCase) >= 0 ||
             tabName.IndexOf("sheet_number", StringComparison.OrdinalIgnoreCase) >= 0 ||
             tabName.IndexOf("sheetnumber", StringComparison.OrdinalIgnoreCase) >= 0);
 
         private static bool IsElementTab(string n) =>
+            !IsProfileMetaTab(n) &&
             !StandardsFillWorkbookReader.IsStandardsTab(n) && (
             n.IndexOf("element", StringComparison.OrdinalIgnoreCase) >= 0 ||
             n.IndexOf("device", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -991,6 +1001,7 @@ namespace RevitLocationExporter.Core
             n.IndexOf("cpk", StringComparison.OrdinalIgnoreCase) >= 0);
 
         private static bool IsCommonSheetTab(string n) =>
+            !IsProfileMetaTab(n) &&
             !StandardsFillWorkbookReader.IsStandardsTab(n) &&
             !IsSheetSpecificTab(n) && (
             n.IndexOf("sheet", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -999,6 +1010,7 @@ namespace RevitLocationExporter.Core
             n.IndexOf("drawing", StringComparison.OrdinalIgnoreCase) >= 0);
 
         private static bool IsExportTab(string n) =>
+            !IsProfileMetaTab(n) &&
             !StandardsFillWorkbookReader.IsStandardsTab(n) && (
             n.IndexOf("export", StringComparison.OrdinalIgnoreCase) >= 0 ||
             n.IndexOf("folder", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -1048,34 +1060,116 @@ namespace RevitLocationExporter.Core
         #region ClosedXML reader (Option 2)
 
         [MethodImpl(MethodImplOptions.NoInlining)]
+        internal static string ReadCellTextSafe(IXLCell cell, HashSet<string>? visitedCells = null)
+        {
+            if (cell == null) return string.Empty;
+            if (cell.HasFormula)
+            {
+                try
+                {
+                    var val = cell.Value;
+                    if (val.IsBlank)
+                    {
+                        cell.InvalidateFormula();
+                        val = cell.Value;
+                    }
+                    if (!val.IsBlank && !val.IsError)
+                        return val.ToString(CultureInfo.InvariantCulture).Trim();
+                }
+                catch
+                {
+                    // Fall back to cached value or C# formula engine
+                }
+
+                try
+                {
+                    var cached = cell.CachedValue;
+                    if (!cached.IsBlank && !cached.IsError)
+                        return cached.ToString(CultureInfo.InvariantCulture).Trim();
+                }
+                catch
+                {
+                    // Fall back to C# formula engine
+                }
+
+                try
+                {
+                    string fA1 = cell.FormulaA1 ?? string.Empty;
+                    if (!string.IsNullOrWhiteSpace(fA1))
+                    {
+                        visitedCells ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        string selfAddr = cell.Address.ToStringRelative();
+                        if (visitedCells.Add(selfAddr))
+                        {
+                            string normalized = "=" + Regex.Replace(
+                                fA1,
+                                @"""(?:[^""]|"""")*""|(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3})\$?(\d+)(?![A-Za-z0-9_\(])",
+                                m => m.Groups[1].Success ? $"[{m.Groups[1].Value}{m.Groups[2].Value}]" : m.Value);
+
+                            if (ExcelFormulaEngine.TryEvaluate(
+                                normalized,
+                                cellRef => ReadCellTextSafe(cell.Worksheet.Cell(cellRef), visitedCells),
+                                out string evaluated,
+                                out _))
+                            {
+                                return evaluated.Trim();
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore
+                }
+            }
+
+            try
+            {
+                string fmt = cell.GetFormattedString();
+                if (!string.IsNullOrEmpty(fmt)) return fmt.Trim();
+            }
+            catch
+            {
+                // Ignore
+            }
+
+            return (cell.GetString() ?? string.Empty).Trim();
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
         private static void ReadExcelBundleClosedXml(string filePath, LocationParameterBundle bundle)
         {
-            using var workbook = new XLWorkbook(filePath);
+            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var workbook = new XLWorkbook(fs);
+            try { workbook.RecalculateAllFormulas(); } catch { }
             var worksheets = workbook.Worksheets.ToList();
             if (worksheets.Count == 0) return;
+
+            var dataSheets = worksheets.Where(w => !IsProfileMetaTab(w.Name)).ToList();
+            if (dataSheets.Count == 0) return;
 
             IXLWorksheet? elemWs = null;
             IXLWorksheet? sheetWs = null;
             IXLWorksheet? specificWs = null;
             IXLWorksheet? exportWs = null;
 
-            if (worksheets.Count == 1)
+            if (dataSheets.Count == 1)
             {
                 // Single tab: used for element, sheet, and export location parameters
-                elemWs = worksheets[0];
-                sheetWs = worksheets[0];
-                exportWs = worksheets[0];
+                elemWs = dataSheets[0];
+                sheetWs = dataSheets[0];
+                exportWs = dataSheets[0];
             }
             else
             {
-                specificWs = worksheets.FirstOrDefault(w => IsSheetSpecificTab(w.Name));
-                elemWs = worksheets.FirstOrDefault(w => IsElementTab(w.Name));
-                sheetWs = worksheets.FirstOrDefault(w => IsCommonSheetTab(w.Name));
-                exportWs = worksheets.FirstOrDefault(w => IsExportTab(w.Name));
+                specificWs = dataSheets.FirstOrDefault(w => IsSheetSpecificTab(w.Name));
+                elemWs = dataSheets.FirstOrDefault(w => IsElementTab(w.Name));
+                sheetWs = dataSheets.FirstOrDefault(w => IsCommonSheetTab(w.Name));
+                exportWs = dataSheets.FirstOrDefault(w => IsExportTab(w.Name));
 
                 // Fallbacks if tab names are generic (e.g. Sheet1, Sheet2)
-                elemWs ??= worksheets[0];
-                sheetWs ??= (worksheets.Count > 1 ? worksheets[1] : worksheets[0]);
+                elemWs ??= dataSheets[0];
+                sheetWs ??= (dataSheets.Count > 1 ? dataSheets[1] : dataSheets[0]);
             }
 
             if (elemWs != null)
@@ -1165,8 +1259,8 @@ namespace RevitLocationExporter.Core
                 var row = ws.Row(r);
                 if (row.IsEmpty()) continue;
 
-                string locator = row.Cell(locatorCol).GetString().Trim();
-                string folder = row.Cell(folderCol).GetString().Trim();
+                string locator = ReadCellTextSafe(row.Cell(locatorCol));
+                string folder = ReadCellTextSafe(row.Cell(folderCol));
 
                 if (!string.IsNullOrEmpty(locator) && !string.IsNullOrEmpty(folder))
                 {
@@ -1220,7 +1314,7 @@ namespace RevitLocationExporter.Core
                 var row = ws.Row(r);
                 if (row.IsEmpty()) continue;
 
-                string key = row.Cell(keyCol).GetString().Trim();
+                string key = ReadCellTextSafe(row.Cell(keyCol));
                 if (string.IsNullOrEmpty(key)) continue;
 
                 var paramMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -1228,7 +1322,7 @@ namespace RevitLocationExporter.Core
                 foreach (var kv in colMap)
                 {
                     if (kv.Key == keyCol) continue;
-                    string val = row.Cell(kv.Key).GetString().Trim();
+                    string val = ReadCellTextSafe(row.Cell(kv.Key));
                     paramMap[kv.Value] = val;
                 }
 
@@ -1320,27 +1414,30 @@ namespace RevitLocationExporter.Core
 
             if (sheetList.Count == 0) return;
 
+            var dataSheets = sheetList.Where(w => !IsProfileMetaTab(w.Name)).ToList();
+            if (dataSheets.Count == 0) return;
+
             // 4. Resolve element, common sheet, sheet-specific and export worksheets
             (string Name, ZipArchiveEntry? Entry) elemSheet = default;
             (string Name, ZipArchiveEntry? Entry) sheetSheet = default;
             (string Name, ZipArchiveEntry? Entry) specificSheet = default;
             (string Name, ZipArchiveEntry? Entry) exportSheet = default;
 
-            if (sheetList.Count == 1)
+            if (dataSheets.Count == 1)
             {
-                elemSheet = sheetList[0];
-                sheetSheet = sheetList[0];
-                exportSheet = sheetList[0];
+                elemSheet = dataSheets[0];
+                sheetSheet = dataSheets[0];
+                exportSheet = dataSheets[0];
             }
             else
             {
-                specificSheet = sheetList.FirstOrDefault(w => IsSheetSpecificTab(w.Name));
-                elemSheet = sheetList.FirstOrDefault(w => IsElementTab(w.Name));
-                sheetSheet = sheetList.FirstOrDefault(w => IsCommonSheetTab(w.Name));
-                exportSheet = sheetList.FirstOrDefault(w => IsExportTab(w.Name));
+                specificSheet = dataSheets.FirstOrDefault(w => IsSheetSpecificTab(w.Name));
+                elemSheet = dataSheets.FirstOrDefault(w => IsElementTab(w.Name));
+                sheetSheet = dataSheets.FirstOrDefault(w => IsCommonSheetTab(w.Name));
+                exportSheet = dataSheets.FirstOrDefault(w => IsExportTab(w.Name));
 
-                if (elemSheet.Entry == null) elemSheet = sheetList[0];
-                if (sheetSheet.Entry == null) sheetSheet = sheetList.Count > 1 ? sheetList[1] : sheetList[0];
+                if (elemSheet.Entry == null) elemSheet = dataSheets[0];
+                if (sheetSheet.Entry == null) sheetSheet = dataSheets.Count > 1 ? dataSheets[1] : dataSheets[0];
             }
 
             if (elemSheet.Entry != null)

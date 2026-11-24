@@ -46,9 +46,12 @@
 		<PackageReference Include="System.Text.Json" Version="10.0.5" />
 	</ItemGroup>
 
-	<!-- Config files -->
+	<!-- Config & Template files -->
 	<ItemGroup>
 		<None Update="trades.json">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+		<None Update="TradeProfile_Master_Template.xlsx">
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 		</None>
 	</ItemGroup>

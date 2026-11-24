@@ -1568,6 +1568,7 @@ using RevitLocationExporter.Core;
 using RevitLocationExporter.Form;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -1614,49 +1615,11 @@ namespace RevitLocationExporter.Commands
             var selectedPaths = SelectRvtFiles();
             if (selectedPaths.Count == 0) return Result.Cancelled;
 
-            // ── 2. Select Excel or CSV ─────────────────────────────────────────
-            LocationParameterBundle? paramBundle = null;
-            string? paramFilePath = SelectParameterFile();
-
-            if (!string.IsNullOrEmpty(paramFilePath))
-            {
-                try
-                {
-                    paramBundle = LocationDataSheetReader.ReadParameterBundle(paramFilePath!);
-                    if (!paramBundle.HasData)
-                    {
-                        TaskDialog.Show("Warning",
-                            "The selected parameter file contained no data rows — falling back to config.");
-                    }
-                    else
-                    {
-                        var infoParts = new List<string>();
-                        if (paramBundle.ElementParameters.Count > 0)
-                            infoParts.Add($"{paramBundle.ElementParameters.Count} element location(s)");
-                        if (paramBundle.SheetParameters.Count > 0)
-                            infoParts.Add($"{paramBundle.SheetParameters.Count} sheet location(s)");
-                        if (paramBundle.SheetNumberParameters.Count > 0)
-                            infoParts.Add($"{paramBundle.SheetNumberParameters.Count} sheet-specific row(s) from '{paramBundle.SheetSpecificTabName}'");
-                        if (paramBundle.ExportLocations.Count > 0)
-                            infoParts.Add($"{paramBundle.ExportLocations.Count} export destination(s)");
-                        if (paramBundle.StandardsFillRows.Count > 0)
-                            infoParts.Add($"{paramBundle.StandardsFillRows.Count} Standards_Fill row(s) from '{paramBundle.StandardsTabName}'");
-
-                        log.Info("Config", $"Loaded parameter workbook: {string.Join(", ", infoParts)}.");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    TaskDialog.Show("Parameter File Error",
-                        $"Failed to read parameter file:\n{ex.Message}\n\nFalling back to built-in config.");
-                }
-            }
-
             var app = commandData.Application.Application;
             var configMgr = TradeConfigManager.Instance;
             var settings = configMgr.Settings;
 
-            // ── 3. Discovery pass: read all project locations and worksets without full open ─
+            // ── 2. Discovery pass: read all project locations and worksets without full open ─
             var fileLocationMap = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             var discoveredWorksetNames = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
             var discoveryErrors = new List<string>();
@@ -1709,7 +1672,7 @@ namespace RevitLocationExporter.Commands
                 return Result.Cancelled;
             }
 
-            // ── 4. Show location & options selection dialog ──────────────────
+            // ── 3. Show location, trade profile & Excel sync dialog ───────────
             var selDlg = new LocationSelectionDialog(fileLocationMap, discoveredWorksetNames);
             if (selDlg.ShowDialog() != true) return Result.Cancelled;
 
@@ -1723,7 +1686,7 @@ namespace RevitLocationExporter.Commands
                 return Result.Cancelled;
             }
 
-            // ── 5. Process selected locations per file ────────────────────────
+            // ── 4. Process selected locations per file ────────────────────────
             var updater = new ProjectInfoUpdater();
 
             try
@@ -1739,7 +1702,15 @@ namespace RevitLocationExporter.Commands
 
                     // Dynamically resolve Trade for this file (e.g. TI0, EL0, ME0, PL0, AR0, ST0)
                     TradeProfile trade = selDlg.SelectedTradeOverride ?? configMgr.DetectTrade(fileName);
+                    trade.EnsureInitialized();
                     log.Info(fileName, $"Identified trade: {trade.TradeName} ({trade.TradeCode})");
+
+                    // Resolve synced Excel bundle from Trade Profile (auto-syncs if Excel changed) or one-off override
+                    LocationParameterBundle? paramBundle =
+                        TradeExcelSyncService.ResolveBundleForRun(trade, selDlg.OneOffExcelOverridePath, log);
+
+                    string effProjNum = !string.IsNullOrWhiteSpace(trade.ProjectNumber) ? trade.ProjectNumber : settings.ProjectNumber;
+                    string effOrig = !string.IsNullOrWhiteSpace(trade.Originator) ? trade.Originator : settings.Originator;
 
                     foreach (string locationName in locationsToProcess)
                     {
@@ -1752,17 +1723,19 @@ namespace RevitLocationExporter.Commands
                             elementParams = paramBundle.GetElementParams(locationName);
                             sheetParams = paramBundle.GetSheetParams(locationName);
 
-                            if (elementParams == null && sheetParams == null)
+                            if (elementParams == null && sheetParams == null && trade.ParameterRules.Count == 0)
                                 log.Warning(locationName,
                                     "No spreadsheet row matched this location in element or sheet tabs — using built-in config.");
                         }
 
                         string? customExportFolder = paramBundle?.GetExportLocation(locationName);
+                        var builtInTokens = BuildLocationTokens(locationName, trade, effProjNum, effOrig);
 
                         try
                         {
                             ProcessOneLocation(app, rvtPath, locationName, elementParams, sheetParams, paramBundle,
-                                               customExportFolder, worksetOptions, log, updater, trade, settings, options);
+                                               customExportFolder, worksetOptions, log, updater, trade, settings, options,
+                                               effProjNum, effOrig, builtInTokens);
                             log.Info(locationName, "All requested steps completed.");
                         }
                         catch (Exception ex)
@@ -1782,6 +1755,28 @@ namespace RevitLocationExporter.Commands
             return log.HasErrors ? Result.Failed : Result.Succeeded;
         }
 
+        private static Dictionary<string, string> BuildLocationTokens(
+            string locationName, TradeProfile trade, string projectNumber, string originator)
+        {
+            string rvtName = trade.FormatFileName(trade.RvtFileNameTemplate, projectNumber, originator, locationName);
+            string ifcName = trade.FormatFileName(trade.IfcFileNameTemplate, projectNumber, originator, locationName);
+            string nwcName = trade.FormatFileName(trade.NwcFileNameTemplate, projectNumber, originator, locationName);
+
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "Location",      locationName },
+                { "Locator Code",  locationName },
+                { "LocatorCode",   locationName },
+                { "TradeCode",     trade.TradeCode },
+                { "TradeName",     trade.TradeName },
+                { "ProjectNumber", projectNumber },
+                { "Originator",    originator },
+                { "RvtFileName",   rvtName },
+                { "IfcFileName",   ifcName },
+                { "NwcFileName",   nwcName }
+            };
+        }
+
         // ════════════════════════════════════════════════════════════════════
         //  LOCATION PIPELINE (OPTION-AWARE)
         // ════════════════════════════════════════════════════════════════════
@@ -1799,7 +1794,10 @@ namespace RevitLocationExporter.Commands
             ProjectInfoUpdater updater,
             TradeProfile trade,
             ProjectSettings settings,
-            ExportExecutionOptions options)
+            ExportExecutionOptions options,
+            string effProjNum,
+            string effOrig,
+            Dictionary<string, string> builtInTokens)
         {
             bool needsExportFolder = options.SaveCentralRvt || options.ExportNwc || options.ExportIfc || options.ExportPdf || options.ExportDwg;
             string exportRoot = string.Empty;
@@ -1872,30 +1870,31 @@ namespace RevitLocationExporter.Commands
                 // 1. Coordinates & Workset Renaming
                 if (options.AlignCoordinatesAndWorksets)
                 {
-                    ActivateProjectLocation(doc, locationName, log, settings);
+                    ActivateProjectLocation(doc, locationName, log, trade);
                     RenameWorksets(doc, locationName, log, trade);
                 }
 
                 // 2. Parameter Population
                 if (options.FillParameters)
                 {
-                    FillSheetCoverParameters(doc, locationName, log);
-                    FillCpkParameters(doc, locationName, elementParams, log, trade, settings);
-                    UpdateProjectInfo(doc, updater, settings.ProjectData, locationName, sheetParams, trade, settings);
+                    FillSheetCoverParameters(doc, locationName, log, trade, elementParams, sheetParams, builtInTokens);
+                    FillCpkParameters(doc, locationName, elementParams, log, trade, settings, builtInTokens);
+                    UpdateProjectInfo(doc, updater, settings.ProjectData, locationName, sheetParams, elementParams,
+                                      log, trade, effProjNum, effOrig, builtInTokens);
                 }
 
                 // Update template '_PL' sheets (Sheet Number, Work Package, Titleblock Checkboxes & Parameters)
                 List<ViewSheet> plSheets = new();
-                if (options.FillParameters && (options.ExportPdf || options.ExportDwg))
+                if (options.FillParameters && (options.ExportPdf || options.ExportDwg ||
+                    trade.ParameterRules.Any(r => r.Enabled && (r.Target == ParameterRuleTarget.Sheet || r.Target == ParameterRuleTarget.Titleblock))))
                 {
-                    plSheets = UpdatePlSheets(doc, locationName, sheetParams, paramBundle, log);
+                    plSheets = UpdatePlSheets(doc, locationName, sheetParams, elementParams, paramBundle, log, trade, builtInTokens);
                 }
-
 
                 if (options.FillParameters && options.EnforceModelStandards)
                 {
                     EnforceModelStandards(doc, rvtPath, locationName, elementParams, sheetParams,
-                                          paramBundle, exportRoot, log, trade, settings, options);
+                                          paramBundle, exportRoot, log, trade, effProjNum, effOrig, options);
                 }
 
                 // 3. Purge Unused
@@ -1907,7 +1906,7 @@ namespace RevitLocationExporter.Commands
                 // 4. 3D Model Exports (NWC, IFC)
                 if (options.ExportNwc || options.ExportIfc)
                 {
-                    Run3DExports(doc, locationName, exportRoot, log, trade, settings, options);
+                    Run3DExports(doc, locationName, exportRoot, log, trade, effProjNum, effOrig, options);
                 }
 
                 // 5. 2D Sheet Exports (PDF, DWG)
@@ -1921,7 +1920,7 @@ namespace RevitLocationExporter.Commands
                 // 6. Save Central RVT Model
                 if (options.SaveCentralRvt)
                 {
-                    SaveAsCentral(doc, locationName, exportRoot, log, trade, settings);
+                    SaveAsCentral(doc, locationName, exportRoot, log, trade, effProjNum, effOrig);
                 }
 
                 doc.Close(false);
@@ -1941,7 +1940,7 @@ namespace RevitLocationExporter.Commands
             Document doc,
             string locationName,
             ProcessLog log,
-            ProjectSettings settings)
+            TradeProfile trade)
         {
             using var tx = new Transaction(doc, "Activate Project Location");
             var failOpts = tx.GetFailureHandlingOptions();
@@ -1955,12 +1954,12 @@ namespace RevitLocationExporter.Commands
                 ?? throw new InvalidOperationException($"Project Location not found: '{locationName}'");
 
             doc.ActiveProjectLocation = location;
-            SetSurveyPoint(doc, settings);
+            SetSurveyPoint(doc, trade);
 
             tx.Commit();
         }
 
-        private static void SetSurveyPoint(Document doc, ProjectSettings settings)
+        private static void SetSurveyPoint(Document doc, TradeProfile trade)
         {
             var sp = GetBasePoint(doc, BuiltInCategory.OST_SharedBasePoint)
                 ?? throw new InvalidOperationException("Survey Point element not found.");
@@ -1977,11 +1976,11 @@ namespace RevitLocationExporter.Commands
             try { sp.Clipped = false; } catch { }
 
             sp.get_Parameter(BuiltInParameter.BASEPOINT_EASTWEST_PARAM)
-              .Set(UnitUtils.ConvertToInternalUnits(settings.SurveyEastMm, UnitTypeId.Millimeters));
+              .Set(UnitUtils.ConvertToInternalUnits(trade.SurveyEastMm, UnitTypeId.Millimeters));
             sp.get_Parameter(BuiltInParameter.BASEPOINT_NORTHSOUTH_PARAM)
-              .Set(UnitUtils.ConvertToInternalUnits(settings.SurveyNorthMm, UnitTypeId.Millimeters));
+              .Set(UnitUtils.ConvertToInternalUnits(trade.SurveyNorthMm, UnitTypeId.Millimeters));
             sp.get_Parameter(BuiltInParameter.BASEPOINT_ELEVATION_PARAM)
-              .Set(UnitUtils.ConvertToInternalUnits(settings.SurveyElevMm, UnitTypeId.Millimeters));
+              .Set(UnitUtils.ConvertToInternalUnits(trade.SurveyElevMm, UnitTypeId.Millimeters));
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -2036,17 +2035,25 @@ namespace RevitLocationExporter.Commands
         //  STEP 3 – SHEET COVER PARAMETERS
         // ════════════════════════════════════════════════════════════════════
 
-        private static void FillSheetCoverParameters(Document doc, string locationName, ProcessLog log)
+        private static void FillSheetCoverParameters(
+            Document doc,
+            string locationName,
+            ProcessLog log,
+            TradeProfile trade,
+            Dictionary<string, string>? elementParams,
+            Dictionary<string, string>? sheetParams,
+            Dictionary<string, string> builtInTokens)
         {
+            string coverName = string.IsNullOrWhiteSpace(trade.SheetCoverName) ? "Sheet Cover" : trade.SheetCoverName;
             var sheets = new FilteredElementCollector(doc)
                 .OfClass(typeof(ViewSheet))
                 .Cast<ViewSheet>()
-                .Where(s => s.Name.IndexOf("Sheet Cover", StringComparison.OrdinalIgnoreCase) >= 0)
+                .Where(s => s.Name.IndexOf(coverName, StringComparison.OrdinalIgnoreCase) >= 0)
                 .ToList();
 
             if (sheets.Count == 0)
             {
-                log.Warning(locationName, "No 'Sheet Cover' sheet found — coordinate params skipped.");
+                log.Warning(locationName, $"No '{coverName}' sheet found — coordinate params skipped.");
                 return;
             }
 
@@ -2086,6 +2093,10 @@ namespace RevitLocationExporter.Commands
             double svpE = ToMm(svp, BuiltInParameter.BASEPOINT_EASTWEST_PARAM);
             double svpZ = ToMm(svp, BuiltInParameter.BASEPOINT_ELEVATION_PARAM);
 
+            var coverRules = trade.ParameterRules
+                .Where(r => r.Enabled && r.Target == ParameterRuleTarget.SheetCover)
+                .ToList();
+
             foreach (var sheet in sheets)
             {
                 SetDouble(sheet, "DAR_PBP_N", pbpN);
@@ -2095,6 +2106,34 @@ namespace RevitLocationExporter.Commands
                 SetDouble(sheet, "DAR_SVP_E", svpE);
                 SetDouble(sheet, "DAR_SVP_Z", svpZ);
                 SetString(sheet, "CPK_Building Location", locationName);
+
+                if (coverRules.Count > 0)
+                {
+                    var matchingRules = coverRules.Where(r => MatchesElementRuleFilter(doc, sheet, null, r.Filter)).ToList();
+                    if (matchingRules.Count > 0)
+                    {
+                        var extra = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            { "DAR_PBP_N", pbpN.ToString(CultureInfo.InvariantCulture) },
+                            { "DAR_PBP_E", pbpE.ToString(CultureInfo.InvariantCulture) },
+                            { "DAR_PBP_Z", pbpZ.ToString(CultureInfo.InvariantCulture) },
+                            { "DAR_SVP_N", svpN.ToString(CultureInfo.InvariantCulture) },
+                            { "DAR_SVP_E", svpE.ToString(CultureInfo.InvariantCulture) },
+                            { "DAR_SVP_Z", svpZ.ToString(CultureInfo.InvariantCulture) },
+                            { "Sheet Number", sheet.SheetNumber },
+                            { "Sheet Name", sheet.Name }
+                        };
+                        var resolved = ExcelFormulaEngine.ResolveRulesInOrder(
+                            matchingRules,
+                            key => LookupCombinedValue(key, extra, sheetParams, elementParams, sheet, null, builtInTokens),
+                            out var warnings);
+                        foreach (var w in warnings) log.Warning(locationName, w);
+                        foreach (var kv in resolved)
+                        {
+                            TryApplyRuleParam(sheet, kv.Key, kv.Value.Value, kv.Value.Rule.Mode);
+                        }
+                    }
+                }
             }
 
             tx.Commit();
@@ -2109,29 +2148,45 @@ namespace RevitLocationExporter.Commands
             ProjectInfoUpdater updater,
             Dictionary<string, string> projectData,
             string locationName,
-            Dictionary<string, string>? paramSet,
+            Dictionary<string, string>? sheetParams,
+            Dictionary<string, string>? elementParams,
+            ProcessLog log,
             TradeProfile trade,
-            ProjectSettings settings)
+            string effProjNum,
+            string effOrig,
+            Dictionary<string, string> builtInTokens)
         {
+            var mergedProjectData = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (projectData != null)
+            {
+                foreach (var kv in projectData) mergedProjectData[kv.Key] = kv.Value;
+            }
+            if (trade.ProjectInfoData != null)
+            {
+                foreach (var kv in trade.ProjectInfoData) mergedProjectData[kv.Key] = kv.Value;
+            }
+            if (!string.IsNullOrWhiteSpace(effProjNum)) mergedProjectData["Project Number"] = effProjNum;
+            if (!string.IsNullOrWhiteSpace(effOrig)) mergedProjectData["Author"] = effOrig;
+
             string buildingName = string.Empty;
 
-            if (paramSet != null)
+            if (sheetParams != null)
             {
-                if (paramSet.TryGetValue("Building Name", out var bName) ||
-                    paramSet.TryGetValue("BuildingName", out bName))
+                if (sheetParams.TryGetValue("Building Name", out var bName) ||
+                    sheetParams.TryGetValue("BuildingName", out bName))
                 {
                     buildingName = bName;
                 }
             }
 
-            string workPackage = ResolveWorkPackage(paramSet);
+            string workPackage = ResolveWorkPackage(sheetParams);
 
             if (string.IsNullOrEmpty(buildingName))
             {
                 try { buildingName = LocatorLookup.GetName(locationName); } catch { }
             }
 
-            string rvtFileName = trade.FormatFileName(trade.RvtFileNameTemplate, settings.ProjectNumber, settings.Originator, locationName);
+            string rvtFileName = trade.FormatFileName(trade.RvtFileNameTemplate, effProjNum, effOrig, locationName);
 
             var dynamic = new List<(string, object)>
             {
@@ -2141,7 +2196,34 @@ namespace RevitLocationExporter.Commands
                 ("Work_Package",    workPackage),
                 ("File_Name",       rvtFileName)
             };
-            updater.UpdateProjectInformation(doc, projectData, dynamic);
+            updater.UpdateProjectInformation(doc, mergedProjectData, dynamic);
+
+            var piRules = trade.ParameterRules
+                .Where(r => r.Enabled && r.Target == ParameterRuleTarget.ProjectInfo)
+                .ToList();
+
+            if (piRules.Count > 0 && doc.ProjectInformation != null)
+            {
+                var dynDict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (k, v) in dynamic) dynDict[k] = Convert.ToString(v, CultureInfo.InvariantCulture) ?? string.Empty;
+
+                var resolved = ExcelFormulaEngine.ResolveRulesInOrder(
+                    piRules,
+                    key => LookupCombinedValue(key, mergedProjectData, dynDict, sheetParams, doc.ProjectInformation, null, builtInTokens, elementParams),
+                    out var warnings);
+                foreach (var w in warnings) log.Warning(locationName, w);
+
+                if (resolved.Count > 0)
+                {
+                    using var tx = new Transaction(doc, "Apply Trade ProjectInfo Rules");
+                    tx.Start();
+                    foreach (var kv in resolved)
+                    {
+                        TryApplyRuleParam(doc.ProjectInformation, kv.Key, kv.Value.Value, kv.Value.Rule.Mode);
+                    }
+                    tx.Commit();
+                }
+            }
         }
 
         private static void FillCpkParameters(
@@ -2150,7 +2232,8 @@ namespace RevitLocationExporter.Commands
             Dictionary<string, string>? csvParamSet,
             ProcessLog log,
             TradeProfile trade,
-            ProjectSettings settings)
+            ProjectSettings settings,
+            Dictionary<string, string> builtInTokens)
         {
             var categoryFilter = trade.GetCategoryFilter();
             if (categoryFilter == null)
@@ -2158,6 +2241,10 @@ namespace RevitLocationExporter.Commands
                 log.Warning(locationName, $"No target categories configured for trade '{trade.TradeName}' — CPK parameter update skipped.");
                 return;
             }
+
+            var elementRules = trade.ParameterRules
+                .Where(r => r.Enabled && r.Target == ParameterRuleTarget.Element)
+                .ToList();
 
             using var tx = new Transaction(doc, "Fill CPK Parameters");
             tx.Start();
@@ -2189,10 +2276,10 @@ namespace RevitLocationExporter.Commands
                 return;
             }
 
+            int instWrites = 0, typeWrites = 0, failures = 0;
+
             if (csvParamSet is { Count: > 0 })
             {
-                int instWrites = 0, typeWrites = 0, failures = 0;
-
                 foreach (var (type, instances) in groups.Values)
                 {
                     Element representative = instances[0];
@@ -2231,13 +2318,10 @@ namespace RevitLocationExporter.Commands
                     }
                 }
 
-                if (failures > 0)
-                    log.Warning(locationName, $"{failures} value(s) failed to convert and were skipped.");
-
                 log.Info(locationName,
                     $"CPK params (CSV, {csvParamSet.Count} column(s)): {instWrites} instance value(s), {typeWrites} type value(s) written.");
             }
-            else
+            else if (elementRules.Count == 0)
             {
                 if (!settings.TryGetCpkFallback(locationName, out string workPackage, out string wbsCode, out string wbsName))
                 {
@@ -2255,6 +2339,112 @@ namespace RevitLocationExporter.Commands
 
                 log.Info(locationName, $"CPK params (config fallback) updated on {updated} {trade.TradeName} element type(s).");
             }
+
+            // Apply Trade Profile Parameter & Formula Rules (Element scope)
+            if (elementRules.Count > 0)
+            {
+                int ruleInstWrites = 0, ruleTypeWrites = 0;
+                var loggedWarnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var (type, instances) in groups.Values)
+                {
+                    Element representative = instances[0];
+                    var matchingRules = elementRules
+                        .Where(r => MatchesElementRuleFilter(doc, representative, type, r.Filter))
+                        .ToList();
+
+                    if (matchingRules.Count == 0) continue;
+
+                    // Precompute type-level values once using representative + type
+                    var typeResolved = ExcelFormulaEngine.ResolveRulesInOrder(
+                        matchingRules,
+                        key => LookupCombinedValue(key, csvParamSet, null, null, representative, type, builtInTokens),
+                        out var typeWarnings);
+                    foreach (var w in typeWarnings)
+                    {
+                        if (loggedWarnings.Add(w)) log.Warning(locationName, w);
+                    }
+
+                    // Determine which rules write to type vs instance on this group
+                    var typeOnlyRules = new List<string>();
+                    foreach (var kv in typeResolved)
+                    {
+                        var instParam = representative.LookupParameter(kv.Key);
+                        if (instParam != null && !instParam.IsReadOnly) continue;
+
+                        var typeParam = type.LookupParameter(kv.Key);
+                        if (typeParam != null && !typeParam.IsReadOnly)
+                        {
+                            try
+                            {
+                                if (TryApplyRuleParam(type, kv.Key, kv.Value.Value, kv.Value.Rule.Mode))
+                                    ruleTypeWrites++;
+                            }
+                            catch { failures++; }
+                            typeOnlyRules.Add(kv.Key);
+                        }
+                    }
+
+                    var typeOnlySet = new HashSet<string>(typeOnlyRules, StringComparer.OrdinalIgnoreCase);
+                    var instRules = matchingRules.Where(r => !typeOnlySet.Contains(r.ParameterName.Trim())).ToList();
+                    if (instRules.Count == 0) continue;
+
+                    foreach (Element inst in instances)
+                    {
+                        var instResolved = ExcelFormulaEngine.ResolveRulesInOrder(
+                            instRules,
+                            key => LookupCombinedValue(key, csvParamSet, null, null, inst, type, builtInTokens),
+                            out var instWarnings);
+                        foreach (var w in instWarnings)
+                        {
+                            if (loggedWarnings.Add(w)) log.Warning(locationName, w);
+                        }
+
+                        foreach (var kv in instResolved)
+                        {
+                            try
+                            {
+                                if (TryApplyRuleParam(inst, kv.Key, kv.Value.Value, kv.Value.Rule.Mode))
+                                    ruleInstWrites++;
+                            }
+                            catch { failures++; }
+                        }
+                    }
+                }
+
+                foreach (Element orphan in orphans)
+                {
+                    var matchingRules = elementRules
+                        .Where(r => MatchesElementRuleFilter(doc, orphan, null, r.Filter))
+                        .ToList();
+                    if (matchingRules.Count == 0) continue;
+
+                    var orphanResolved = ExcelFormulaEngine.ResolveRulesInOrder(
+                        matchingRules,
+                        key => LookupCombinedValue(key, csvParamSet, null, null, orphan, null, builtInTokens),
+                        out var orphanWarnings);
+                    foreach (var w in orphanWarnings)
+                    {
+                        if (loggedWarnings.Add(w)) log.Warning(locationName, w);
+                    }
+
+                    foreach (var kv in orphanResolved)
+                    {
+                        try
+                        {
+                            if (TryApplyRuleParam(orphan, kv.Key, kv.Value.Value, kv.Value.Rule.Mode))
+                                ruleInstWrites++;
+                        }
+                        catch { failures++; }
+                    }
+                }
+
+                log.Info(locationName,
+                    $"Trade parameter rules ({elementRules.Count} active): {ruleInstWrites} instance value(s), {ruleTypeWrites} type value(s) written.");
+            }
+
+            if (failures > 0)
+                log.Warning(locationName, $"{failures} value(s) failed to convert and were skipped.");
 
             tx.Commit();
         }
@@ -2301,7 +2491,8 @@ namespace RevitLocationExporter.Commands
             string exportRoot,
             ProcessLog log,
             TradeProfile trade,
-            ProjectSettings settings,
+            string effProjNum,
+            string effOrig,
             ExportExecutionOptions options)
         {
             Dictionary<string, ElementId> exportViewIds = CreateExportViews(doc, locationName, log);
@@ -2311,19 +2502,20 @@ namespace RevitLocationExporter.Commands
                 // ── IFC Export ─────────────────────────────────────────────
                 if (options.ExportIfc)
                 {
-                    if (File.Exists(settings.IFCJsonPath))
+                    string ifcJsonPath = trade.ResolveIfcJsonPath();
+                    if (File.Exists(ifcJsonPath))
                     {
                         string ifcFolder = Path.Combine(exportRoot, "IFC");
                         Directory.CreateDirectory(ifcFolder);
 
-                        string ifcFileName = trade.FormatFileName(trade.IfcFileNameTemplate, settings.ProjectNumber, settings.Originator, locationName);
+                        string ifcFileName = trade.FormatFileName(trade.IfcFileNameTemplate, effProjNum, effOrig, locationName);
                         string ifcFullPath = Path.Combine(ifcFolder, ifcFileName + ".ifc");
 
                         IFCExportOptions ifcOpts;
                         using (var txIfc = new Transaction(doc, $"IFC Export Setup – {locationName}"))
                         {
                             txIfc.Start();
-                            ifcOpts = IFCJsonLoader.Load(settings.IFCJsonPath, doc, locationName);
+                            ifcOpts = IFCJsonLoader.Load(ifcJsonPath, doc, locationName);
 
                             if (exportViewIds.TryGetValue("IFC", out ElementId ifcViewId) && ifcViewId != ElementId.InvalidElementId)
                                 ifcOpts.FilterViewId = ifcViewId;
@@ -2335,7 +2527,7 @@ namespace RevitLocationExporter.Commands
                     }
                     else
                     {
-                        log.Warning(locationName, $"IFCSettings.json not found at '{settings.IFCJsonPath}' — IFC export skipped.");
+                        log.Warning(locationName, $"IFCSettings.json not found at '{ifcJsonPath}' — IFC export skipped.");
                     }
                 }
 
@@ -2348,7 +2540,7 @@ namespace RevitLocationExporter.Commands
                     string nwcFolder = Path.Combine(exportRoot, "NWC");
                     Directory.CreateDirectory(nwcFolder);
 
-                    string nwcFileName = trade.FormatFileName(trade.NwcFileNameTemplate, settings.ProjectNumber, settings.Originator, locationName);
+                    string nwcFileName = trade.FormatFileName(trade.NwcFileNameTemplate, effProjNum, effOrig, locationName);
                     string nwcFullPath = Path.Combine(nwcFolder, nwcFileName + ".nwc");
 
                     var navOpts = new NavisworksExportOptions
@@ -2391,8 +2583,11 @@ namespace RevitLocationExporter.Commands
             Document doc,
             string locationName,
             Dictionary<string, string>? paramSet,
+            Dictionary<string, string>? elementParams,
             LocationParameterBundle? paramBundle,
-            ProcessLog log)
+            ProcessLog log,
+            TradeProfile trade,
+            Dictionary<string, string> builtInTokens)
         {
             var titleParts = doc.Title.Split('-');
             if (titleParts.Length < 4)
@@ -2402,6 +2597,18 @@ namespace RevitLocationExporter.Commands
             }
 
             var nativeModelLocator = titleParts[3].Trim();
+            string coverName = string.IsNullOrWhiteSpace(trade.SheetCoverName) ? "Sheet Cover" : trade.SheetCoverName;
+            string includeToken = trade.SheetIncludeToken ?? string.Empty;
+            var deletePatterns = (trade.SheetDeletePatterns ?? new List<string>())
+                .Where(p => !string.IsNullOrWhiteSpace(p))
+                .ToList();
+
+            var sheetRules = trade.ParameterRules
+                .Where(r => r.Enabled && r.Target == ParameterRuleTarget.Sheet)
+                .ToList();
+            var tbRules = trade.ParameterRules
+                .Where(r => r.Enabled && r.Target == ParameterRuleTarget.Titleblock)
+                .ToList();
 
             using var tx = new Transaction(doc, $"Update PL Sheets for {locationName}");
             tx.Start();
@@ -2417,12 +2624,13 @@ namespace RevitLocationExporter.Commands
             foreach (var s in allSheets)
             {
                 // Preserve Sheet Cover
-                if (s.Name.IndexOf("Sheet Cover", StringComparison.OrdinalIgnoreCase) >= 0)
+                if (s.Name.IndexOf(coverName, StringComparison.OrdinalIgnoreCase) >= 0)
                     continue;
 
-                // Delete sheets containing "210001_EN"
-                if (s.SheetNumber.IndexOf("210001_EN", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    s.Name.IndexOf("210001_EN", StringComparison.OrdinalIgnoreCase) >= 0)
+                // Delete sheets matching configured delete patterns (e.g. "210001_EN")
+                if (deletePatterns.Any(pat =>
+                    s.SheetNumber.IndexOf(pat, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    s.Name.IndexOf(pat, StringComparison.OrdinalIgnoreCase) >= 0))
                 {
                     sheetsToDelete.Add(s);
                     continue;
@@ -2450,14 +2658,13 @@ namespace RevitLocationExporter.Commands
                         log.Warning(locationName, $"Could not delete obsolete sheet '{s.SheetNumber}': {ex.Message}");
                     }
                 }
-                log.Info(locationName, $"Deleted {deletedCount} sheet(s) not matching native locator '{nativeModelLocator}' or containing '210001_EN'.");
+                log.Info(locationName, $"Deleted {deletedCount} sheet(s) not matching native locator '{nativeModelLocator}' or matching delete rules.");
             }
 
-            // ── 2. Collect template '_PL' sheets matching nativeModelLocator ──
+            // ── 2. Collect template sheets matching nativeModelLocator ──
             var plSheets = new FilteredElementCollector(doc)
                 .OfClass(typeof(ViewSheet))
                 .Cast<ViewSheet>()
-                //.Where(s => !s.IsPlaceholder && s.SheetNumber.IndexOf("_PL", StringComparison.OrdinalIgnoreCase) >= 0)
                 .Where(s =>
                 {
                     string[] parts = s.SheetNumber.Split('-');
@@ -2468,7 +2675,7 @@ namespace RevitLocationExporter.Commands
 
             if (plSheets.Count == 0)
             {
-                log.Warning(locationName, $"No template sheets containing '_PL' matching native locator '{nativeModelLocator}' were found in the model.");
+                log.Warning(locationName, $"No template sheets matching native locator '{nativeModelLocator}' were found in the model.");
                 tx.Commit();
                 return plSheets;
             }
@@ -2527,20 +2734,29 @@ namespace RevitLocationExporter.Commands
                         .WhereElementIsNotElementType()
                         .ToList();
 
+                    var sheetMetaTokens = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        { "Sheet Number", sheet.SheetNumber },
+                        { "SheetNumber", sheet.SheetNumber },
+                        { "Sheet Name", sheet.Name },
+                        { "SheetName", sheet.Name }
+                    };
+
                     foreach (var tb in titleBlocks)
                     {
-                        
-                        // 4a. Work Package checkboxes: ON for this sheet's WP, OFF for all others (incl. native building's WP)
-                        if (!string.IsNullOrEmpty(sheetWp))
+                        // 4a. Work Package checkboxes: ON for this sheet's WP, OFF for all others
+                        if (trade.SyncWorkPackageCheckboxes)
                         {
-                            SyncWorkPackageCheckboxes(doc, tb, sheetWp, sheet.SheetNumber, locationName, log, typeWpAssigned);
+                            if (!string.IsNullOrEmpty(sheetWp))
+                            {
+                                SyncWorkPackageCheckboxes(doc, tb, sheetWp, sheet.SheetNumber, locationName, log, typeWpAssigned);
+                            }
+                            else
+                            {
+                                log.Warning(locationName,
+                                    $"[{sheet.SheetNumber}] No Work_Package resolved (Sheet_Params / Sheet_Specific_Params) — native WP checkbox left as-is.");
+                            }
                         }
-                        else
-                        {
-                            log.Warning(locationName,
-                                $"[{sheet.SheetNumber}] No Work_Package resolved (Sheet_Params / Sheet_Specific_Params) — native WP checkbox left as-is.");
-                        }
-
 
                         // 4b. Map effective values onto Titleblock
                         if (effective != null)
@@ -2549,6 +2765,26 @@ namespace RevitLocationExporter.Commands
                             {
                                 if (ReservedSheetKeys.Contains(kvp.Key)) continue;
                                 if (TryApplyParam(tb, kvp.Key, kvp.Value)) appliedKeys.Add(kvp.Key);
+                            }
+                        }
+
+                        // 4c. Apply Trade Profile Titleblock rules
+                        if (tbRules.Count > 0)
+                        {
+                            ElementType? tbType = doc.GetElement(tb.GetTypeId()) as ElementType;
+                            var matchingTb = tbRules.Where(r => MatchesElementRuleFilter(doc, tb, tbType, r.Filter)).ToList();
+                            if (matchingTb.Count > 0)
+                            {
+                                var resolvedTb = ExcelFormulaEngine.ResolveRulesInOrder(
+                                    matchingTb,
+                                    key => LookupCombinedValue(key, sheetMetaTokens, effective, elementParams, tb, tbType, builtInTokens, null, sheet),
+                                    out var tbWarnings);
+                                foreach (var w in tbWarnings) log.Warning(locationName, w);
+                                foreach (var kv in resolvedTb)
+                                {
+                                    if (TryApplyRuleParam(tb, kv.Key, kv.Value.Value, kv.Value.Rule.Mode))
+                                        appliedKeys.Add(kv.Key);
+                                }
                             }
                         }
 
@@ -2562,6 +2798,35 @@ namespace RevitLocationExporter.Commands
                         {
                             if (ReservedSheetKeys.Contains(kvp.Key)) continue;
                             if (TryApplyParam(sheet, kvp.Key, kvp.Value)) appliedKeys.Add(kvp.Key);
+                        }
+                    }
+
+                    // 5b. Apply Trade Profile Sheet rules
+                    if (sheetRules.Count > 0)
+                    {
+                        var matchingSheetRules = sheetRules.Where(r => MatchesElementRuleFilter(doc, sheet, null, r.Filter)).ToList();
+                        if (matchingSheetRules.Count > 0)
+                        {
+                            var resolvedSheet = ExcelFormulaEngine.ResolveRulesInOrder(
+                                matchingSheetRules,
+                                key => LookupCombinedValue(key, sheetMetaTokens, effective, elementParams, sheet, null, builtInTokens),
+                                out var sWarnings);
+                            foreach (var w in sWarnings) log.Warning(locationName, w);
+                            foreach (var kv in resolvedSheet)
+                            {
+                                if (kv.Key.Equals("Sheet Name", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    if (!string.IsNullOrWhiteSpace(kv.Value.Value) &&
+                                        (kv.Value.Rule.Mode == ParameterFillMode.Overwrite || string.IsNullOrWhiteSpace(sheet.Name)))
+                                    {
+                                        sheet.Name = kv.Value.Value;
+                                        appliedKeys.Add(kv.Key);
+                                    }
+                                    continue;
+                                }
+                                if (TryApplyRuleParam(sheet, kv.Key, kv.Value.Value, kv.Value.Rule.Mode))
+                                    appliedKeys.Add(kv.Key);
+                            }
                         }
                     }
 
@@ -2584,7 +2849,7 @@ namespace RevitLocationExporter.Commands
             tx.Commit();
 
             log.Info(locationName,
-                $"Updated {plSheets.Count} '_PL' sheet(s): {renamedCount} renamed, {tbUpdatedCount} titleblock(s) synced, " +
+                $"Updated {plSheets.Count} sheet(s): {renamedCount} renamed, {tbUpdatedCount} titleblock(s) synced, " +
                 $"{specificHits} sheet(s) received sheet-specific values.");
 
             if (unmatchedSpecificKeys.Count > 0)
@@ -2608,23 +2873,27 @@ namespace RevitLocationExporter.Commands
                     .ToList();
 
                 if (orphanRows.Count > 0)
-                    log.Warning(locationName, $"Sheet_Specific_Params row(s) with no matching '_PL' sheet: {string.Join(", ", orphanRows)}");
+                    log.Warning(locationName, $"Sheet_Specific_Params row(s) with no matching sheet: {string.Join(", ", orphanRows)}");
             }
 
-            return plSheets.Where(s => s.SheetNumber.Contains("_PL")).ToList();
+            if (string.IsNullOrWhiteSpace(includeToken))
+                return plSheets;
+
+            return plSheets.Where(s => s.SheetNumber.IndexOf(includeToken, StringComparison.OrdinalIgnoreCase) >= 0).ToList();
         }
 
 
         private static void EnforceModelStandards(
-    Document doc, ModelPath rvtPath, string locationName,
-    Dictionary<string, string>? elementParams, Dictionary<string, string>? sheetParams,
-    LocationParameterBundle? paramBundle, string exportRoot, ProcessLog log,
-    TradeProfile trade, ProjectSettings settings, ExportExecutionOptions options)
+            Document doc, ModelPath rvtPath, string locationName,
+            Dictionary<string, string>? elementParams, Dictionary<string, string>? sheetParams,
+            LocationParameterBundle? paramBundle, string exportRoot, ProcessLog log,
+            TradeProfile trade, string effProjNum, string effOrig, ExportExecutionOptions options)
         {
-            var rules = ModelCheckerSetLoader.GetForTrade(trade.TradeCode, log);
+            string mcFolder = trade.ResolveModelCheckersFolder();
+            var rules = ModelCheckerSetLoader.GetForTrade(trade.TradeCode, log, mcFolder);
             if (rules.Count == 0)
             {
-                log.Info(locationName, $"No Model Checker sets in '{ModelCheckerSetLoader.DefaultFolder}' (_ALL / {trade.TradeCode}) — standards step skipped.");
+                log.Info(locationName, $"No Model Checker sets in '{mcFolder}' (_ALL / {trade.TradeCode}) — standards step skipped.");
                 return;
             }
 
@@ -2640,7 +2909,7 @@ namespace RevitLocationExporter.Commands
             var ctx = new StandardsContext
             {
                 LocationCode = locationName,
-                RvtFileName = trade.FormatFileName(trade.RvtFileNameTemplate, settings.ProjectNumber, settings.Originator, locationName),
+                RvtFileName = trade.FormatFileName(trade.RvtFileNameTemplate, effProjNum, effOrig, locationName),
                 ReportFolder = reportFolder,
                 ApplyFixes = !options.ModelStandardsDryRun,
                 LocationValues = values,
@@ -2913,7 +3182,8 @@ namespace RevitLocationExporter.Commands
             string exportRoot,
             ProcessLog log,
             TradeProfile trade,
-            ProjectSettings settings)
+            string effProjNum,
+            string effOrig)
         {
             if (!doc.IsWorkshared)
             {
@@ -2930,7 +3200,7 @@ namespace RevitLocationExporter.Commands
             string rvtFolder = Path.Combine(exportRoot, "RVT");
             Directory.CreateDirectory(rvtFolder);
 
-            string rvtFileName = trade.FormatFileName(trade.RvtFileNameTemplate, settings.ProjectNumber, settings.Originator, locationName) + ".rvt";
+            string rvtFileName = trade.FormatFileName(trade.RvtFileNameTemplate, effProjNum, effOrig, locationName) + ".rvt";
             string newPath = Path.Combine(rvtFolder, rvtFileName);
 
             var saveOpts = new SaveAsOptions
@@ -3077,16 +3347,6 @@ namespace RevitLocationExporter.Commands
                 Multiselect = true
             };
             return dlg.ShowDialog() == true ? dlg.FileNames.ToList() : new List<string>();
-        }
-
-        private static string? SelectParameterFile()
-        {
-            var dlg = new OpenFileDialog
-            {
-                Title = "Select Location Sheet Parameters (Excel or CSV) - Cancel to skip",
-                Filter = "Excel or CSV Files (*.xlsx;*.csv)|*.xlsx;*.csv|Excel Files (*.xlsx)|*.xlsx|CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
-            };
-            return dlg.ShowDialog() == true ? dlg.FileName : null;
         }
 
         internal static Dictionary<string, Dictionary<string, string>> ReadCsv(string csvPath)
@@ -3278,6 +3538,149 @@ namespace RevitLocationExporter.Commands
             string value = raw.Equals("<CLEAR>", StringComparison.OrdinalIgnoreCase) ? string.Empty : raw;
             SetParamValue(p, value);
             return true;
+        }
+
+        private static bool TryApplyRuleParam(Element e, string name, string raw, ParameterFillMode mode)
+        {
+            var p = e.LookupParameter(name);
+            if (p == null || p.IsReadOnly) return false;
+
+            if (mode == ParameterFillMode.FillIfEmpty && !IsParameterEmpty(p))
+                return false;
+
+            string value = raw.Equals("<CLEAR>", StringComparison.OrdinalIgnoreCase) ? string.Empty : raw;
+            SetParamValue(p, value);
+            return true;
+        }
+
+        private static bool IsParameterEmpty(Parameter p)
+        {
+            if (!p.HasValue) return true;
+            return p.StorageType switch
+            {
+                StorageType.String => string.IsNullOrWhiteSpace(p.AsString()),
+                StorageType.ElementId => p.AsElementId() == ElementId.InvalidElementId,
+                _ => false
+            };
+        }
+
+        private static bool MatchesElementRuleFilter(Document doc, Element elem, ElementType? type, string? filter)
+        {
+            if (string.IsNullOrWhiteSpace(filter) || filter!.Trim() == "*")
+                return true;
+
+            string bicName = string.Empty;
+            string catName = elem.Category?.Name ?? string.Empty;
+            if (elem.Category != null)
+            {
+                try
+                {
+                    var bic = (BuiltInCategory)elem.Category.Id.Value;
+                    bicName = bic.ToString();
+                }
+                catch { }
+            }
+
+            string famName = type?.FamilyName ?? string.Empty;
+            string typeName = type?.Name ?? elem.Name ?? string.Empty;
+            string famType = string.IsNullOrEmpty(famName) ? typeName : $"{famName} : {typeName}";
+
+            string[] tokens = filter.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string rawToken in tokens)
+            {
+                string pat = rawToken.Trim();
+                if (pat.Length == 0 || pat == "*") return true;
+
+                if (MatchesPattern(bicName, pat) ||
+                    MatchesPattern(catName, pat) ||
+                    MatchesPattern(famName, pat) ||
+                    MatchesPattern(typeName, pat) ||
+                    MatchesPattern(famType, pat))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool MatchesPattern(string value, string pattern)
+        {
+            if (string.IsNullOrEmpty(value)) return false;
+            if (pattern.IndexOf('*') >= 0 || pattern.IndexOf('?') >= 0)
+            {
+                string rx = "^" + Regex.Escape(pattern).Replace("\\*", ".*").Replace("\\?", ".") + "$";
+                return Regex.IsMatch(value, rx, RegexOptions.IgnoreCase);
+            }
+            return value.Equals(pattern, StringComparison.OrdinalIgnoreCase) ||
+                   value.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static string? LookupCombinedValue(
+            string key,
+            IDictionary<string, string>? primaryDict,
+            IDictionary<string, string>? secondaryDict,
+            IDictionary<string, string>? tertiaryDict,
+            Element? primaryElem,
+            ElementType? elemType,
+            IDictionary<string, string>? builtInTokens,
+            IDictionary<string, string>? quaternaryDict = null,
+            Element? secondaryElem = null)
+        {
+            if (string.IsNullOrWhiteSpace(key)) return null;
+
+            if (primaryDict != null && primaryDict.TryGetValue(key, out var v1)) return v1;
+            if (secondaryDict != null && secondaryDict.TryGetValue(key, out var v2)) return v2;
+            if (tertiaryDict != null && tertiaryDict.TryGetValue(key, out var v3)) return v3;
+            if (quaternaryDict != null && quaternaryDict.TryGetValue(key, out var v4)) return v4;
+
+            if (primaryElem != null)
+            {
+                string? rv = ReadRevitParamAsString(primaryElem, elemType, key);
+                if (rv != null) return rv;
+            }
+
+            if (secondaryElem != null)
+            {
+                string? rv2 = ReadRevitParamAsString(secondaryElem, null, key);
+                if (rv2 != null) return rv2;
+            }
+
+            if (builtInTokens != null && builtInTokens.TryGetValue(key, out var tok)) return tok;
+
+            return null;
+        }
+
+        private static string? ReadRevitParamAsString(Element elem, ElementType? type, string paramName)
+        {
+            if (paramName.Equals("Category", StringComparison.OrdinalIgnoreCase))
+                return elem.Category?.Name;
+            if (paramName.Equals("Family", StringComparison.OrdinalIgnoreCase))
+                return type?.FamilyName;
+            if (paramName.Equals("Type", StringComparison.OrdinalIgnoreCase))
+                return type?.Name ?? elem.Name;
+            if (paramName.Equals("Family and Type", StringComparison.OrdinalIgnoreCase))
+                return type != null ? $"{type.FamilyName}: {type.Name}" : elem.Name;
+
+            Parameter? p = elem.LookupParameter(paramName) ?? type?.LookupParameter(paramName);
+            if ((p == null || !p.HasValue) && paramName.Equals("Level", StringComparison.OrdinalIgnoreCase))
+            {
+                if (elem.LevelId != ElementId.InvalidElementId)
+                    return elem.Document.GetElement(elem.LevelId)?.Name;
+                return null;
+            }
+            if (p == null || !p.HasValue) return null;
+
+            return p.StorageType switch
+            {
+                StorageType.String => p.AsString(),
+                StorageType.Integer => p.AsInteger().ToString(CultureInfo.InvariantCulture),
+                StorageType.Double => p.AsValueString() ?? p.AsDouble().ToString(CultureInfo.InvariantCulture),
+                StorageType.ElementId => p.AsValueString()
+                    ?? elem.Document.GetElement(p.AsElementId())?.Name
+                    ?? p.AsElementId().Value.ToString(CultureInfo.InvariantCulture),
+                _ => null
+            };
         }
 
         // ════════════════════════════════════════════════════════════════════
