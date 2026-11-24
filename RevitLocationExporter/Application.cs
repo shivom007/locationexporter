@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Windows.Media.Imaging;
 using Autodesk.Revit.UI;
@@ -82,31 +84,87 @@ namespace RevitLocationExporter
             const string tabName = "RevitLocationExporter";
             const string panelName = "Commands";
 
-            application.CreateRibbonTab(tabName);
-            var panel = application.CreateRibbonPanel(tabName, panelName);
+            // 1. Safely create Ribbon Tab (ignore if it already exists)
+            try
+            {
+                application.CreateRibbonTab(tabName);
+            }
+            catch (Autodesk.Revit.Exceptions.ArgumentException)
+            {
+                // Tab already exists (e.g. reload via Add-In Manager or previous session)
+            }
+            catch (Exception)
+            {
+                // Ignore fallback
+            }
+
+            // 2. Safely get or create Ribbon Panel
+            RibbonPanel? panel = null;
+            try
+            {
+                var existingPanels = application.GetRibbonPanels(tabName);
+                panel = existingPanels?.FirstOrDefault(p => string.Equals(p.Name, panelName, StringComparison.OrdinalIgnoreCase));
+            }
+            catch
+            {
+                // Ignore if GetRibbonPanels throws
+            }
+
+            if (panel == null)
+            {
+                try
+                {
+                    panel = application.CreateRibbonPanel(tabName, panelName);
+                }
+                catch (Autodesk.Revit.Exceptions.ArgumentException)
+                {
+                    var existingPanels = application.GetRibbonPanels(tabName);
+                    panel = existingPanels?.FirstOrDefault(p => string.Equals(p.Name, panelName, StringComparison.OrdinalIgnoreCase));
+                }
+            }
+
+            if (panel == null) return;
+
+            // Helper to prevent duplicate buttons if panel was already created
+            void AddButtonIfMissing(PushButtonData buttonData)
+            {
+                try
+                {
+                    var items = panel.GetItems();
+                    if (items != null && items.Any(i => string.Equals(i.Name, buttonData.Name, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        return;
+                    }
+                    panel.AddItem(buttonData);
+                }
+                catch
+                {
+                    // Ignore duplicate item error
+                }
+            }
 
             // 1. Primary command: Location Exporter
-            panel.AddItem(Button<Commands.LocationExporterCommand>(
+            AddButtonIfMissing(Button<Commands.LocationExporterCommand>(
                 "LocationExporterCommand", "Location\nExporter", "LocationExporter"));
 
             // 2. Central Model Location Splitter
-            panel.AddItem(Button<Commands.LocationSplitterCentral>(
+            AddButtonIfMissing(Button<Commands.LocationSplitterCentral>(
                 "LocationSplitter", "Location\nSplitter", "LocationSplitter"));
 
             // 3. Batch CPK Updater
-            panel.AddItem(Button<Commands.BatchCpkUpdaterCommand>(
+            AddButtonIfMissing(Button<Commands.BatchCpkUpdaterCommand>(
                 "BatchCPK", "Batch CPK\nUpdater", "BatchCPK"));
 
             // 4. Batch Coordinate Manager
-            panel.AddItem(Button<Commands.BatchCoordinateManagerCommand>(
+            AddButtonIfMissing(Button<Commands.BatchCoordinateManagerCommand>(
                 "BatchCoordinateManager", "Batch Coordinate\nManager", "BatchCoordinateManager"));
 
             // 5. Delete Locations Tool
-            panel.AddItem(Button<Commands.DeleteProjectLocations>(
+            AddButtonIfMissing(Button<Commands.DeleteProjectLocations>(
                 "DeleteLocations", "Delete Locations", "DeleteLocations"));
 
             // 6. Trade Profiles Manager & Builder
-            panel.AddItem(Button<Commands.TradeProfileManagerCommand>(
+            AddButtonIfMissing(Button<Commands.TradeProfileManagerCommand>(
                 "TradeProfileManager", "Trade\nProfiles", "TradeProfiles"));
         }
 
