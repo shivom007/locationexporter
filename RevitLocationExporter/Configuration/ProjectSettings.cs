@@ -30,9 +30,10 @@ namespace RevitLocationExporter.Configuration
             { "Project Address",          "Aleje Jerozolimskie 142B, 02-305 Warsaw, Republic of Poland" },
             { "Organization Name",        "Dar Al-Handasah Consultants (Shair and Partners) s.a.l" },
             { "Organization Description", "MCE Contractor" },
-            { "Author",                   "Dar" },
+            { "Author",                   "DAR" },
             { "Group_Leader",             "Meghanath Gatade" },
-            { "Model_Coordinator",        "Anuj Mishra" }
+            { "Model_Coordinator",        "Anuj Mishra" },
+            { "Project Status",        "Stage 3" }
         };
 
         public Dictionary<string, (string WorkPackage, string WbsCode, string WbsName)> CpkFallbackData { get; set; } =

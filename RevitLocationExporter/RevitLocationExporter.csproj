@@ -53,6 +53,12 @@
 		</None>
 	</ItemGroup>
 
+	<ItemGroup>
+		<None Update="ModelCheckers\**\*.xml">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
+
 	<!-- Icons embedded as resources -->
 	<ItemGroup>
 		<Resource Include="Resources\Icons\*.png" />

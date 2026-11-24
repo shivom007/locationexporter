@@ -43,6 +43,8 @@ namespace RevitLocationExporter.Form
         private readonly WpfCheckBox _cbRvt;
         private readonly WpfCheckBox _cbPdf;
         private readonly WpfCheckBox _cbDwg;
+        private readonly WpfCheckBox _cbModelStandards;
+        private readonly WpfCheckBox _cbStandardsDryRun;
 
         // Workset Master Checkbox
         private readonly WpfCheckBox _cbAllTradeWorksets;
@@ -263,9 +265,34 @@ namespace RevitLocationExporter.Form
             _cbFillParams = MakeCheckBox("Fill CPK & Sheet Params", true);
             _cbCoordWorksets = MakeCheckBox("Coordinates & Worksets", true);
             _cbPurge = MakeCheckBox("Purge Unused Elements", true);
+            // Model Checker standards: OFF by default, only available with "Fill CPK & Sheet Params"
+            _cbModelStandards = MakeCheckBox("Model Checker Standards", false);
+            _cbModelStandards.Margin = new Thickness(18, 0, 0, 2);
+            _cbModelStandards.ToolTip =
+                "Fill empty parameters / fix worksets required by the Model Checker XMLs\n" +
+                "(ModelCheckers\\_ALL + ModelCheckers\\<Trade>). Writes a CSV report.\n" +
+                "Runs after sheet updates, before Purge and exports.";
+            _cbStandardsDryRun = MakeCheckBox("Dry run (report only)", false);
+            _cbStandardsDryRun.Margin = new Thickness(36, 0, 0, 4);
+            _cbStandardsDryRun.ToolTip = "Evaluate and write the CSV report, but roll back all model changes.";
+
             col1.Children.Add(_cbFillParams);
+            col1.Children.Add(_cbModelStandards);
+            col1.Children.Add(_cbStandardsDryRun);
             col1.Children.Add(_cbCoordWorksets);
             col1.Children.Add(_cbPurge);
+
+            // Enable chain: Fill Params -> Model Checker Standards -> Dry run
+            void SyncStandardsEnabled()
+            {
+                _cbModelStandards.IsEnabled = _cbFillParams.IsChecked == true;
+                _cbStandardsDryRun.IsEnabled = _cbModelStandards.IsEnabled && _cbModelStandards.IsChecked == true;
+            }
+            _cbFillParams.Checked += (s, e) => SyncStandardsEnabled();
+            _cbFillParams.Unchecked += (s, e) => SyncStandardsEnabled();
+            _cbModelStandards.Checked += (s, e) => SyncStandardsEnabled();
+            _cbModelStandards.Unchecked += (s, e) => SyncStandardsEnabled();
+            SyncStandardsEnabled();
             Grid.SetColumn(col1, 0);
             opsGrid.Children.Add(col1);
 
@@ -728,6 +755,8 @@ namespace RevitLocationExporter.Form
             Options.SaveCentralRvt = _cbRvt.IsChecked == true;
             Options.ExportPdf = _cbPdf.IsChecked == true;
             Options.ExportDwg = _cbDwg.IsChecked == true;
+            Options.EnforceModelStandards = _cbModelStandards.IsEnabled && _cbModelStandards.IsChecked == true;
+            Options.ModelStandardsDryRun = Options.EnforceModelStandards && _cbStandardsDryRun.IsChecked == true;
 
             // 5. Record selected trade profile override
             if (_cbTradeProfile.SelectedItem is ComboBoxItem cbi && cbi.Tag is TradeProfile tp)

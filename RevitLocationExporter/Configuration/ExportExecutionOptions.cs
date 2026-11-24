@@ -33,6 +33,12 @@ namespace RevitLocationExporter.Configuration
         /// <summary>Export matching location sheets to DWG.</summary>
         public bool ExportDwg { get; set; } = false;
 
+        /// Fill missing parameters / fix worksets from the Model Checker check-sets.
+        public bool EnforceModelStandards { get; set; } = false;
+
+        /// true = evaluate and write the CSV report, but roll back all changes.
+        public bool ModelStandardsDryRun { get; set; } = false;
+
         /// <summary>Returns true if at least one operation is enabled.</summary>
         public bool HasAnyOperationSelected =>
             FillParameters ||
