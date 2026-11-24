@@ -1,0 +1,76 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net48</TargetFramework>
+		<UseWPF>true</UseWPF>
+		<UseWindowsForms>true</UseWindowsForms>
+		<Nullable>enable</Nullable>
+		<LangVersion>latest</LangVersion>
+		<ImplicitUsings>true</ImplicitUsings>
+		<PlatformTarget>x64</PlatformTarget>
+		<AssemblyName>RevitLocationExporter</AssemblyName>
+		<RootNamespace>RevitLocationExporter</RootNamespace>
+
+		<!-- ADD THIS: Match solution configurations -->
+		<Configurations>Debug R24;Release R24</Configurations>
+
+		<!-- Debug: launch Revit 2024 directly (only active for Debug R24) -->
+		<StartAction Condition="'$(Configuration)' == 'Debug R24'">Program</StartAction>
+		<StartProgram Condition="'$(Configuration)' == 'Debug R24'">C:\Program Files\Autodesk\Revit 2024\Revit.exe</StartProgram>
+		<StartArguments Condition="'$(Configuration)' == 'Debug R24'">/language ENG</StartArguments>
+	</PropertyGroup>
+
+	<ItemGroup>
+	  <Compile Remove="Commands\LocationSplitterCentral_v2.cs" />
+	  <Compile Remove="Commands\LocationSplitterCentral_v3.cs" />
+	</ItemGroup>
+
+	<!-- Revit 2024 API — Private=false means NOT copied to output (Revit owns these DLLs) -->
+	<ItemGroup>
+		<Reference Include="RevitAPI">
+			<HintPath>C:\Program Files\Autodesk\Revit 2024\RevitAPI.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="RevitAPIUI">
+			<HintPath>C:\Program Files\Autodesk\Revit 2024\RevitAPIUI.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="System.IO.Compression" />
+		<Reference Include="System.IO.Compression.FileSystem" />
+		<Reference Include="System.Xml.Linq" />
+	</ItemGroup>
+
+	<!-- NuGet packages — only what's actually used in the code -->
+	<ItemGroup>
+		<PackageReference Include="ClosedXML" Version="0.105.0" />
+		<PackageReference Include="System.Text.Json" Version="10.0.5" />
+	</ItemGroup>
+
+	<!-- Config files -->
+	<ItemGroup>
+		<None Update="trades.json">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
+
+	<!-- Icons embedded as resources -->
+	<ItemGroup>
+		<Resource Include="Resources\Icons\*.png" />
+	</ItemGroup>
+
+	<!-- Post-build: copy DLL + addin manifest to Revit addins folder -->
+	<Target Name="DeployToRevit" AfterTargets="Build">
+		<PropertyGroup>
+			<AddinFolder>$(APPDATA)\Autodesk\Revit\Addins\2024\RevitLocationExporter\</AddinFolder>
+			<AddinRoot>$(APPDATA)\Autodesk\Revit\Addins\2024\</AddinRoot>
+		</PropertyGroup>
+		<MakeDir Directories="$(AddinFolder)" />
+		<ItemGroup>
+			<DeployFiles Include="$(OutputPath)**\*.*" />
+		</ItemGroup>
+		<Copy SourceFiles="@(DeployFiles)" DestinationFiles="@(DeployFiles -> '$(AddinFolder)%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" ContinueOnError="true" />
+		<Copy SourceFiles="RevitLocationExporter.addin" DestinationFolder="$(AddinRoot)" SkipUnchangedFiles="true" ContinueOnError="true" />
+		<Message Text="Deployed to $(AddinFolder)" Importance="high" />
+	</Target>
+
+</Project>

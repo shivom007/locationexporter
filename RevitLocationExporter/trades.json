@@ -1,0 +1,133 @@
+{
+  "DefaultProject": "P00100087",
+  "DefaultOriginator": "DAR",
+  "ActiveTradeCode": "TI0",
+  "Trades": {
+    "TI0": {
+      "TradeName": "Telecom",
+      "DisciplineFolder": "EL",
+      "WorkPackageSubfolder": "Telecom - Building Package",
+      "WorksetMatchTokens": [ "TI0" ],
+      "WorksetSuffixes": [ "_TI0_FA", "_TI0_SD", "_TI0_DD", "_TI0_LC" ],
+      "TargetCategoryNames": [
+        "OST_FireAlarmDevices",
+        "OST_DataDevices",
+        "OST_SecurityDevices",
+        "OST_TelephoneDevices",
+        "OST_AudioVisualDevices",
+        "OST_CommunicationDevices",
+        "OST_CableTray",
+        "OST_CableTrayFitting",
+        "OST_Conduit",
+        "OST_ConduitFitting"
+      ],
+      "RvtFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-M3-XX0001_PE",
+      "IfcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-E3-XX0001_PE",
+      "NwcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-PE-XX0001_PE"
+    },
+    "EL0": {
+      "TradeName": "Electrical",
+      "DisciplineFolder": "EL",
+      "WorkPackageSubfolder": "Electrical - Building Package",
+      "WorksetMatchTokens": [ "EL0", "EL" ],
+      "WorksetSuffixes": [ "_EL0_PWR", "_EL0_LGT", "_EL0_EAR", "_EL0_SEC" ],
+      "TargetCategoryNames": [
+        "OST_ElectricalEquipment",
+        "OST_ElectricalFixtures",
+        "OST_LightingFixtures",
+        "OST_LightingDevices",
+        "OST_CableTray",
+        "OST_CableTrayFitting",
+        "OST_Conduit",
+        "OST_ConduitFitting"
+      ],
+      "RvtFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-M3-XX0001_PE",
+      "IfcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-E3-XX0001_PE",
+      "NwcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-PE-XX0001_PE"
+    },
+    "ME0": {
+      "TradeName": "Mechanical",
+      "DisciplineFolder": "ME",
+      "WorkPackageSubfolder": "Mechanical - Building Package",
+      "WorksetMatchTokens": [ "ME0", "HV0", "ME" ],
+      "WorksetSuffixes": [ "_ME0_SUP", "_ME0_RET", "_ME0_EXH", "_ME0_EQP" ],
+      "TargetCategoryNames": [
+        "OST_DuctCurves",
+        "OST_DuctFitting",
+        "OST_DuctAccessory",
+        "OST_DuctTerminal",
+        "OST_MechanicalEquipment"
+      ],
+      "RvtFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-M3-XX0001_PE",
+      "IfcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-E3-XX0001_PE",
+      "NwcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-PE-XX0001_PE"
+    },
+    "PL0": {
+      "TradeName": "Plumbing",
+      "DisciplineFolder": "PL",
+      "WorkPackageSubfolder": "Plumbing - Building Package",
+      "WorksetMatchTokens": [ "PL0", "PL" ],
+      "WorksetSuffixes": [ "_PL0_DOM", "_PL0_SAN", "_PL0_DRN", "_PL0_EQP" ],
+      "TargetCategoryNames": [
+        "OST_PipeCurves",
+        "OST_PipeFitting",
+        "OST_PipeAccessory",
+        "OST_PlumbingFixtures",
+        "OST_MechanicalEquipment"
+      ],
+      "RvtFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-M3-XX0001_PE",
+      "IfcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-E3-XX0001_PE",
+      "NwcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-PE-XX0001_PE"
+    },
+    "FP0": {
+      "TradeName": "Fire Protection",
+      "DisciplineFolder": "FP",
+      "WorkPackageSubfolder": "Fire Protection - Building Package",
+      "WorksetMatchTokens": [ "FP0", "FP" ],
+      "WorksetSuffixes": [ "_FP0_SPK", "_FP0_HYD", "_FP0_EQP" ],
+      "TargetCategoryNames": [
+        "OST_Sprinklers",
+        "OST_PipeCurves",
+        "OST_PipeFitting",
+        "OST_PipeAccessory"
+      ],
+      "RvtFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-M3-XX0001_PE",
+      "IfcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-E3-XX0001_PE",
+      "NwcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-PE-XX0001_PE"
+    },
+    "AR0": {
+      "TradeName": "Architecture",
+      "DisciplineFolder": "AR",
+      "WorkPackageSubfolder": "Architecture - Building Package",
+      "WorksetMatchTokens": [ "AR0", "A00", "AR" ],
+      "WorksetSuffixes": [ "_AR0_WAL", "_AR0_FLR", "_AR0_ROF", "_AR0_DOOR" ],
+      "TargetCategoryNames": [
+        "OST_Walls",
+        "OST_Doors",
+        "OST_Windows",
+        "OST_Floors",
+        "OST_Ceilings",
+        "OST_Rooms"
+      ],
+      "RvtFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-M3-XX0001_PE",
+      "IfcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-E3-XX0001_PE",
+      "NwcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-PE-XX0001_PE"
+    },
+    "ST0": {
+      "TradeName": "Structure",
+      "DisciplineFolder": "ST",
+      "WorkPackageSubfolder": "Structure - Building Package",
+      "WorksetMatchTokens": [ "ST0", "S00", "ST" ],
+      "WorksetSuffixes": [ "_ST0_COL", "_ST0_BEA", "_ST0_FOU", "_ST0_SLB" ],
+      "TargetCategoryNames": [
+        "OST_StructuralColumns",
+        "OST_StructuralFraming",
+        "OST_StructuralFoundation",
+        "OST_Floors"
+      ],
+      "RvtFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-M3-XX0001_PE",
+      "IfcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-E3-XX0001_PE",
+      "NwcFileNameTemplate": "{ProjectNumber}-{Originator}-{TradeCode}-{Location}-XX-PE-XX0001_PE"
+    }
+  }
+}

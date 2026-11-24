@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+    <AddIn Type="Application">
+        <Name>RevitLocationExporter</Name>
+        <Assembly>RevitLocationExporter\RevitLocationExporter.dll</Assembly>
+        <!--<AddInId>DBC2E10D-09A9-4FB8-949D-A77FB571CCA9</AddInId>-->
+		<AddInId>D47E8BF1-E29B-4709-8FC2-9F9FE673E99C</AddInId>
+		
+        <FullClassName>RevitLocationExporter.Application</FullClassName>
+        <VendorId>Development</VendorId>
+        <VendorDescription></VendorDescription>
+        <VendorEmail></VendorEmail>
+    </AddIn>
+</RevitAddIns>

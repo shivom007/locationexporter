@@ -1,0 +1,53 @@
+<Window x:Class="RevitLocationExporter.Form.ProgressWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Batch CPK Updater — Processing"
+        Width="520"
+        Height="180"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize"
+        ShowInTaskbar="True"
+        Topmost="True"
+        WindowStyle="ToolWindow">
+
+    <Window.Resources>
+        <!-- Subtle dark-grey palette consistent with Revit UI -->
+        <SolidColorBrush x:Key="AccentBrush"  Color="#0078D4"/>
+        <SolidColorBrush x:Key="TextBrush"    Color="#1A1A1A"/>
+        <SolidColorBrush x:Key="MutedBrush"   Color="#666666"/>
+        <SolidColorBrush x:Key="BgBrush"      Color="#F5F5F5"/>
+    </Window.Resources>
+
+    <Border Background="{StaticResource BgBrush}" Padding="20">
+        <StackPanel>
+
+            <!-- Current file label -->
+            <TextBlock x:Name="FileNameText"
+                       Text="Initialising…"
+                       FontSize="13"
+                       FontWeight="SemiBold"
+                       Foreground="{StaticResource TextBrush}"
+                       TextTrimming="CharacterEllipsis"
+                       Margin="0,0,0,10"/>
+
+            <!-- Progress bar -->
+            <ProgressBar x:Name="MainProgressBar"
+                         Height="14"
+                         Minimum="0"
+                         Maximum="100"
+                         Value="0"
+                         Foreground="{StaticResource AccentBrush}"
+                         Background="#DDDDDD"
+                         BorderThickness="0"
+                         Margin="0,0,0,10"/>
+
+            <!-- Status text -->
+            <TextBlock x:Name="StatusText"
+                       Text="Starting…"
+                       FontSize="11"
+                       Foreground="{StaticResource MutedBrush}"
+                       TextTrimming="CharacterEllipsis"/>
+
+        </StackPanel>
+    </Border>
+</Window>
