@@ -83,6 +83,15 @@ namespace RevitLocationExporter.Form
         private readonly WpfTextBox _tbSampleInputs;
         private readonly TextBlock _txtFormulaStatus;
 
+        // Tab 3B: Sheet Text Notes
+        private readonly WpfDataGrid _dgTextNoteRules;
+        private readonly ObservableCollection<TextNoteRuleRowVm> _textNoteRows = new();
+        private readonly WpfTextBox _tbTnSampleSheet;
+        private readonly WpfTextBox _tbTnSampleLocator;
+        private readonly WpfTextBox _tbTnSampleInput;
+        private readonly WpfTextBox _tbTnSampleOutput;
+        private readonly TextBlock _txtTnStatus;
+
         // Tab 4: Categories & Worksets
         private readonly WpfTextBox _tbMatchTokens;
         private readonly WpfTextBox _tbWorksetSuffixes;
@@ -720,6 +729,190 @@ namespace RevitLocationExporter.Form
             };
             tab3Dock.Children.Add(_dgRules);
 
+            // ─── TAB 3B: SHEET TEXT NOTES ────────────────────────────────────
+            var tabTn = new TabItem { Header = "Sheet Text Notes", Style = (Style)Resources["ModernTabItem"] };
+            var tabTnDock = new DockPanel { Margin = new Thickness(18) };
+            tabTn.Content = tabTnDock;
+            tabs.Items.Add(tabTn);
+
+            var tnHeaderDock = new DockPanel { Margin = new Thickness(0, 0, 0, 10) };
+            DockPanel.SetDock(tnHeaderDock, Dock.Top);
+
+            var tnBtns = new StackPanel { Orientation = WpfOrientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            DockPanel.SetDock(tnBtns, Dock.Right);
+
+            var btnAddTn = new WpfButton { Content = "+ Add Rule", Style = (Style)Resources["PrimaryButton"], Padding = new Thickness(10, 5, 10, 5), Margin = new Thickness(0, 0, 6, 0) };
+            btnAddTn.Click += (s, e) => OnAddTextNoteRule();
+
+            var btnDupTn = new WpfButton { Content = "Duplicate", Style = (Style)Resources["SmallButton"], Margin = new Thickness(0, 0, 6, 0) };
+            btnDupTn.Click += (s, e) => OnDuplicateTextNoteRule();
+
+            var btnDelTn = new WpfButton { Content = "Remove", Style = (Style)Resources["SmallButton"], Margin = new Thickness(0, 0, 6, 0) };
+            btnDelTn.Foreground = UiTheme.DangerBrush;
+            btnDelTn.Click += (s, e) => OnRemoveTextNoteRule();
+
+            var btnPresetTiu = new WpfButton { Content = "Add TIU Inert Gas Preset", Style = (Style)Resources["SecondaryButton"], Padding = new Thickness(10, 5, 10, 5) };
+            btnPresetTiu.Click += (s, e) => OnAddTiuPresetRule();
+
+            tnBtns.Children.Add(btnAddTn);
+            tnBtns.Children.Add(btnDupTn);
+            tnBtns.Children.Add(btnDelTn);
+            tnBtns.Children.Add(btnPresetTiu);
+            tnHeaderDock.Children.Add(tnBtns);
+            tnHeaderDock.Children.Add(UiTheme.MakeSectionLabel("Sheet & View TextNote Replacement Rules",
+                "Opt-in find/replace rules for TextNotes (e.g. Mechanical drawing locators on Telecom TIU Fire sheets). Supports [Location], [ProjectNumber], [Originator], and '=' formulas."));
+            tabTnDock.Children.Add(tnHeaderDock);
+
+            // Live TextNote Preview card docked at bottom
+            var tnPreviewCard = UiTheme.MakeCard(new Thickness(12, 10, 12, 10), new Thickness(0, 10, 0, 0), subtle: true);
+            DockPanel.SetDock(tnPreviewCard, Dock.Bottom);
+            var tnPrevStack = new StackPanel();
+            tnPreviewCard.Child = tnPrevStack;
+
+            var tnPrevTop = new DockPanel { Margin = new Thickness(0, 0, 0, 6) };
+            _txtTnStatus = new TextBlock
+            {
+                FontSize = 11.5,
+                Foreground = UiTheme.TextMutedBrush,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            DockPanel.SetDock(_txtTnStatus, Dock.Right);
+            tnPrevTop.Children.Add(_txtTnStatus);
+            tnPrevTop.Children.Add(new TextBlock
+            {
+                Text = "Live TextNote Preview",
+                FontSize = 12,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = UiTheme.TextPrimaryBrush,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            tnPrevStack.Children.Add(tnPrevTop);
+
+            var tnCtxGrid = new Grid { Margin = new Thickness(0, 0, 0, 8) };
+            tnCtxGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(100) });
+            tnCtxGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            tnCtxGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(110) });
+            tnCtxGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(160) });
+
+            var lblSh = UiTheme.MakeFieldLabel("Sample Sheet:");
+            Grid.SetColumn(lblSh, 0); tnCtxGrid.Children.Add(lblSh);
+            _tbTnSampleSheet = new WpfTextBox
+            {
+                Style = (Style)Resources["MonoTextBox"],
+                Text = "P00100087-DAR-TIU-AFNXIEELS-GF-DR-240001_PL",
+                Margin = new Thickness(0, 0, 12, 0)
+            };
+            _tbTnSampleSheet.TextChanged += (s, e) => RefreshTextNotePreview();
+            Grid.SetColumn(_tbTnSampleSheet, 1); tnCtxGrid.Children.Add(_tbTnSampleSheet);
+
+            var lblLoc = UiTheme.MakeFieldLabel("Target Location:");
+            Grid.SetColumn(lblLoc, 2); tnCtxGrid.Children.Add(lblLoc);
+            _tbTnSampleLocator = new WpfTextBox
+            {
+                Style = (Style)Resources["MonoTextBox"],
+                Text = "AFNXIEELS"
+            };
+            _tbTnSampleLocator.TextChanged += (s, e) => RefreshTextNotePreview();
+            Grid.SetColumn(_tbTnSampleLocator, 3); tnCtxGrid.Children.Add(_tbTnSampleLocator);
+            tnPrevStack.Children.Add(tnCtxGrid);
+
+            var tnSplitGrid = new Grid();
+            tnSplitGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            tnSplitGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(12) });
+            tnSplitGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var inCol = new StackPanel();
+            inCol.Children.Add(new TextBlock { Text = "Sample TextNote (Before)", FontSize = 11, Foreground = UiTheme.TextMutedBrush, Margin = new Thickness(0, 0, 0, 3) });
+            _tbTnSampleInput = new WpfTextBox
+            {
+                Style = (Style)Resources["MonoTextBox"],
+                AcceptsReturn = true,
+                TextWrapping = TextWrapping.Wrap,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                VerticalContentAlignment = VerticalAlignment.Top,
+                Padding = new Thickness(8, 6, 8, 6),
+                Height = 76,
+                Text = "ZAKRESKOWANE POMIESZCZENIA SĄ CHRONIONE INSTALACJĄ\r\nGASZENIA GAZEM „INERT GAS SYSTEM”. DOKŁADNE INFORMACJE\r\nPATRZ RYSUNEK BRANŻY MECHANICZNEJ NR\r\nP00100087-DAR-MIF-LFEXREECS-GF-DR-314001_PL"
+            };
+            _tbTnSampleInput.TextChanged += (s, e) => RefreshTextNotePreview();
+            inCol.Children.Add(_tbTnSampleInput);
+            Grid.SetColumn(inCol, 0); tnSplitGrid.Children.Add(inCol);
+
+            var outCol = new StackPanel();
+            outCol.Children.Add(new TextBlock { Text = "Result After Rules (After)", FontSize = 11, Foreground = UiTheme.TextMutedBrush, Margin = new Thickness(0, 0, 0, 3) });
+            _tbTnSampleOutput = new WpfTextBox
+            {
+                Style = (Style)Resources["MonoTextBox"],
+                IsReadOnly = true,
+                AcceptsReturn = true,
+                TextWrapping = TextWrapping.Wrap,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                VerticalContentAlignment = VerticalAlignment.Top,
+                Padding = new Thickness(8, 6, 8, 6),
+                Height = 76
+            };
+            outCol.Children.Add(_tbTnSampleOutput);
+            Grid.SetColumn(outCol, 2); tnSplitGrid.Children.Add(outCol);
+            tnPrevStack.Children.Add(tnSplitGrid);
+            tabTnDock.Children.Add(tnPreviewCard);
+
+            _dgTextNoteRules = new WpfDataGrid
+            {
+                Style = (Style)Resources["ModernDataGrid"],
+                ItemsSource = _textNoteRows
+            };
+            _dgTextNoteRules.Columns.Add(new DataGridCheckBoxColumn
+            {
+                Header = "On",
+                Width = 40,
+                Binding = new WpfBinding("Enabled") { UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }
+            });
+            _dgTextNoteRules.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Sheet Filter",
+                Width = 100,
+                ElementStyle = paramColStyle,
+                Binding = new WpfBinding("SheetFilter") { UpdateSourceTrigger = UpdateSourceTrigger.LostFocus }
+            });
+            _dgTextNoteRules.Columns.Add(new DataGridComboBoxColumn
+            {
+                Header = "Scope",
+                Width = 170,
+                ItemsSource = Enum.GetValues(typeof(TextNoteScope)),
+                SelectedItemBinding = new WpfBinding("Scope") { UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }
+            });
+            _dgTextNoteRules.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Note Contains",
+                Width = 140,
+                Binding = new WpfBinding("NoteContains") { UpdateSourceTrigger = UpdateSourceTrigger.LostFocus }
+            });
+            _dgTextNoteRules.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Find Pattern",
+                Width = new DataGridLength(1, DataGridLengthUnitType.Star),
+                ElementStyle = formulaColStyle,
+                Binding = new WpfBinding("FindPattern") { UpdateSourceTrigger = UpdateSourceTrigger.LostFocus }
+            });
+            _dgTextNoteRules.Columns.Add(new DataGridCheckBoxColumn
+            {
+                Header = "Regex",
+                Width = 52,
+                Binding = new WpfBinding("IsRegex") { UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }
+            });
+            _dgTextNoteRules.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Replace With",
+                Width = new DataGridLength(1.1, DataGridLengthUnitType.Star),
+                ElementStyle = formulaColStyle,
+                Binding = new WpfBinding("ReplaceWith") { UpdateSourceTrigger = UpdateSourceTrigger.LostFocus }
+            });
+            _dgTextNoteRules.CellEditEnding += (s, e) =>
+            {
+                Dispatcher.BeginInvoke(new Action(() => RefreshTextNotePreview()));
+            };
+            tabTnDock.Children.Add(_dgTextNoteRules);
+
             // ─── TAB 4: CATEGORIES & WORKSETS ────────────────────────────────
             var tab4 = new TabItem { Header = "Categories & Worksets", Style = (Style)Resources["ModernTabItem"] };
             var tab4Dock = new DockPanel { Margin = new Thickness(18) };
@@ -1019,6 +1212,10 @@ namespace RevitLocationExporter.Form
                 foreach (var r in p.ParameterRules)
                     _ruleRows.Add(ParameterRuleRowVm.FromRule(r));
 
+                _textNoteRows.Clear();
+                foreach (var r in p.TextNoteRules)
+                    _textNoteRows.Add(TextNoteRuleRowVm.FromRule(r));
+
                 _tbSurveyN.Text = p.SurveyNorthMm.ToString(CultureInfo.InvariantCulture);
                 _tbSurveyE.Text = p.SurveyEastMm.ToString(CultureInfo.InvariantCulture);
                 _tbSurveyZ.Text = p.SurveyElevMm.ToString(CultureInfo.InvariantCulture);
@@ -1045,6 +1242,7 @@ namespace RevitLocationExporter.Form
                 RefreshExcelSyncTab(p);
                 PopulateSampleLocatorDropdown(p);
                 RefreshFormulaPreviews();
+                RefreshTextNotePreview();
             }
             finally
             {
@@ -1058,6 +1256,7 @@ namespace RevitLocationExporter.Form
                 return;
 
             _dgRules.CommitEdit(DataGridEditingUnit.Row, true);
+            _dgTextNoteRules.CommitEdit(DataGridEditingUnit.Row, true);
             _dgProjectInfo.CommitEdit(DataGridEditingUnit.Row, true);
 
             string newCode = (_tbTradeCode.Text ?? string.Empty).Trim().ToUpperInvariant();
@@ -1085,6 +1284,11 @@ namespace RevitLocationExporter.Form
 
             p.ParameterRules = _ruleRows
                 .Where(r => !string.IsNullOrWhiteSpace(r.ParameterName) || !string.IsNullOrWhiteSpace(r.ValueOrFormula))
+                .Select(r => r.ToRule())
+                .ToList();
+
+            p.TextNoteRules = _textNoteRows
+                .Where(r => !string.IsNullOrWhiteSpace(r.FindPattern))
                 .Select(r => r.ToRule())
                 .ToList();
 
@@ -2008,6 +2212,158 @@ namespace RevitLocationExporter.Form
                 get => _value;
                 set { _value = value ?? string.Empty; OnPropertyChanged(nameof(Value)); }
             }
+
+            public event PropertyChangedEventHandler? PropertyChanged;
+            private void OnPropertyChanged(string prop) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(prop));
+        }
+
+        // ── Sheet TextNote Rule Handlers & ViewModel ─────────────────────────
+
+        private void OnAddTextNoteRule()
+        {
+            var vm = new TextNoteRuleRowVm
+            {
+                Enabled = true,
+                SheetFilter = "*TIU*",
+                Scope = TextNoteScope.SheetsPlacedViewsAndLegends,
+                NoteContains = "",
+                FindPattern = "P00100087-DAR-MIF-[A-Z0-9]+",
+                IsRegex = true,
+                ReplaceWith = @"=[ProjectNumber]&""-""&[Originator]&""-MIF-""&[Location]"
+            };
+            _textNoteRows.Add(vm);
+            _dgTextNoteRules.SelectedItem = vm;
+            RefreshTextNotePreview();
+        }
+
+        private void OnDuplicateTextNoteRule()
+        {
+            if (_dgTextNoteRules.SelectedItem is not TextNoteRuleRowVm sel) return;
+            var copy = TextNoteRuleRowVm.FromRule(sel.ToRule());
+            int idx = _textNoteRows.IndexOf(sel);
+            _textNoteRows.Insert(idx + 1, copy);
+            _dgTextNoteRules.SelectedItem = copy;
+            RefreshTextNotePreview();
+        }
+
+        private void OnRemoveTextNoteRule()
+        {
+            if (_dgTextNoteRules.SelectedItem is not TextNoteRuleRowVm sel) return;
+            _textNoteRows.Remove(sel);
+            RefreshTextNotePreview();
+        }
+
+        private void OnAddTiuPresetRule()
+        {
+            var vm = TextNoteRuleRowVm.FromRule(TextNoteRule.CreateDefaultTiuInertGasRule());
+            _textNoteRows.Add(vm);
+            _dgTextNoteRules.SelectedItem = vm;
+            RefreshTextNotePreview();
+        }
+
+        private void RefreshTextNotePreview()
+        {
+            string input = _tbTnSampleInput.Text ?? string.Empty;
+            string sheetNum = (_tbTnSampleSheet.Text ?? string.Empty).Trim();
+            string loc = string.IsNullOrWhiteSpace(_tbTnSampleLocator.Text) ? "AFNXIEELS" : _tbTnSampleLocator.Text.Trim();
+            string proj = string.IsNullOrWhiteSpace(_tbProjectNumber.Text) ? "P00100087" : _tbProjectNumber.Text.Trim();
+            string orig = string.IsNullOrWhiteSpace(_tbOriginator.Text) ? "DAR" : _tbOriginator.Text.Trim();
+            string code = string.IsNullOrWhiteSpace(_tbTradeCode.Text) ? "TI0" : _tbTradeCode.Text.Trim().ToUpperInvariant();
+
+            var lookup = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "Location", loc },
+                { "Locator Code", loc },
+                { "LocatorCode", loc },
+                { "ProjectNumber", proj },
+                { "Originator", orig },
+                { "TradeCode", code },
+                { "Sheet Number", sheetNum },
+                { "SheetNumber", sheetNum }
+            };
+
+            string working = input;
+            bool changed = false;
+            string? firstError = null;
+
+            foreach (var rowVm in _textNoteRows)
+            {
+                var rule = rowVm.ToRule();
+                if (!rule.Enabled) continue;
+                if (!TextNoteRuleProcessor.MatchesSheetFilter(sheetNum, sheetNum, rule.SheetFilter)) continue;
+
+                if (TextNoteRuleProcessor.ApplyRuleToText(rule, working, k => lookup.TryGetValue(k, out var v) ? v : null, out string next, out string? err))
+                {
+                    working = next;
+                    changed = true;
+                }
+                else if (!string.IsNullOrEmpty(err) && firstError == null)
+                {
+                    firstError = err;
+                }
+            }
+
+            _tbTnSampleOutput.Text = working;
+            if (!string.IsNullOrEmpty(firstError))
+            {
+                _txtTnStatus.Text = $"Error: {firstError}";
+                _txtTnStatus.Foreground = UiTheme.DangerBrush;
+            }
+            else if (changed)
+            {
+                _txtTnStatus.Text = "Matched & updated";
+                _txtTnStatus.Foreground = UiTheme.SuccessBrush;
+            }
+            else
+            {
+                _txtTnStatus.Text = "No rule matched — unchanged";
+                _txtTnStatus.Foreground = UiTheme.TextMutedBrush;
+            }
+        }
+
+        private sealed class TextNoteRuleRowVm : INotifyPropertyChanged
+        {
+            private bool _enabled = true;
+            private string _sheetFilter = "*";
+            private TextNoteScope _scope = TextNoteScope.SheetsPlacedViewsAndLegends;
+            private string _noteContains = string.Empty;
+            private string _findPattern = string.Empty;
+            private bool _isRegex = true;
+            private string _replaceWith = string.Empty;
+            private string _notes = string.Empty;
+
+            public bool Enabled { get => _enabled; set { _enabled = value; OnPropertyChanged(nameof(Enabled)); } }
+            public string SheetFilter { get => _sheetFilter; set { _sheetFilter = value ?? "*"; OnPropertyChanged(nameof(SheetFilter)); } }
+            public TextNoteScope Scope { get => _scope; set { _scope = value; OnPropertyChanged(nameof(Scope)); } }
+            public string NoteContains { get => _noteContains; set { _noteContains = value ?? string.Empty; OnPropertyChanged(nameof(NoteContains)); } }
+            public string FindPattern { get => _findPattern; set { _findPattern = value ?? string.Empty; OnPropertyChanged(nameof(FindPattern)); } }
+            public bool IsRegex { get => _isRegex; set { _isRegex = value; OnPropertyChanged(nameof(IsRegex)); } }
+            public string ReplaceWith { get => _replaceWith; set { _replaceWith = value ?? string.Empty; OnPropertyChanged(nameof(ReplaceWith)); } }
+            public string Notes { get => _notes; set { _notes = value ?? string.Empty; OnPropertyChanged(nameof(Notes)); } }
+
+            public TextNoteRule ToRule() => new()
+            {
+                Enabled = Enabled,
+                SheetFilter = string.IsNullOrWhiteSpace(SheetFilter) ? "*" : SheetFilter.Trim(),
+                Scope = Scope,
+                NoteContains = NoteContains ?? string.Empty,
+                FindPattern = FindPattern ?? string.Empty,
+                IsRegex = IsRegex,
+                ReplaceWith = ReplaceWith ?? string.Empty,
+                Notes = Notes ?? string.Empty
+            };
+
+            public static TextNoteRuleRowVm FromRule(TextNoteRule r) => new()
+            {
+                Enabled = r.Enabled,
+                SheetFilter = string.IsNullOrWhiteSpace(r.SheetFilter) ? "*" : r.SheetFilter,
+                Scope = r.Scope,
+                NoteContains = r.NoteContains,
+                FindPattern = r.FindPattern,
+                IsRegex = r.IsRegex,
+                ReplaceWith = r.ReplaceWith,
+                Notes = r.Notes
+            };
 
             public event PropertyChangedEventHandler? PropertyChanged;
             private void OnPropertyChanged(string prop) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(prop));

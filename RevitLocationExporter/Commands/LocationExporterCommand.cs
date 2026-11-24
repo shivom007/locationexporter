@@ -1883,10 +1883,11 @@ namespace RevitLocationExporter.Commands
                                       log, trade, effProjNum, effOrig, builtInTokens);
                 }
 
-                // Update template '_PL' sheets (Sheet Number, Work Package, Titleblock Checkboxes & Parameters)
+                // Update template '_PL' sheets (Sheet Number, Work Package, Titleblock Checkboxes, Parameters & TextNote Rules)
                 List<ViewSheet> plSheets = new();
                 if (options.FillParameters && (options.ExportPdf || options.ExportDwg ||
-                    trade.ParameterRules.Any(r => r.Enabled && (r.Target == ParameterRuleTarget.Sheet || r.Target == ParameterRuleTarget.Titleblock))))
+                    trade.ParameterRules.Any(r => r.Enabled && (r.Target == ParameterRuleTarget.Sheet || r.Target == ParameterRuleTarget.Titleblock)) ||
+                    trade.TextNoteRules.Any(r => r.Enabled)))
                 {
                     plSheets = UpdatePlSheets(doc, locationName, sheetParams, elementParams, paramBundle, log, trade, builtInTokens);
                 }
@@ -2844,6 +2845,14 @@ namespace RevitLocationExporter.Commands
                 {
                     log.Warning(locationName, $"Failed updating sheet '{originalNum}': {ex.Message}");
                 }
+            }
+
+            // 7. Apply opt-in per-trade TextNote replacement rules across updated sheets/views/legends
+            if (trade.TextNoteRules.Any(r => r.Enabled))
+            {
+                TextNoteRuleProcessor.ApplyToSheets(
+                    doc, plSheets, trade.TextNoteRules, nativeModelLocator,
+                    locationName, paramSet, elementParams, builtInTokens, log);
             }
 
             tx.Commit();

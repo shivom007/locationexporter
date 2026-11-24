@@ -983,7 +983,9 @@ namespace RevitLocationExporter.Core
             tabName.Equals("Trade_Config", StringComparison.OrdinalIgnoreCase) ||
             tabName.Equals("TradeConfig", StringComparison.OrdinalIgnoreCase) ||
             tabName.Equals("Parameter_Rules", StringComparison.OrdinalIgnoreCase) ||
-            tabName.Equals("ParameterRules", StringComparison.OrdinalIgnoreCase);
+            tabName.Equals("ParameterRules", StringComparison.OrdinalIgnoreCase) ||
+            tabName.Equals("TextNote_Rules", StringComparison.OrdinalIgnoreCase) ||
+            tabName.Equals("TextNoteRules", StringComparison.OrdinalIgnoreCase);
 
         private static bool IsSheetSpecificTab(string tabName) =>
             !IsProfileMetaTab(tabName) &&

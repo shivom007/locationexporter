@@ -23,6 +23,54 @@ namespace RevitLocationExporter.Configuration
         FillIfEmpty
     }
 
+    /// <summary>View search scope for sheet TextNote replacement rules.</summary>
+    public enum TextNoteScope
+    {
+        SheetsOnly,
+        SheetsAndPlacedViews,
+        SheetsPlacedViewsAndLegends
+    }
+
+    /// <summary>
+    /// Opt-in per-trade rule that updates TextNote contents on matching sheets/views
+    /// (e.g. swapping cross-discipline drawing locator codes on TIU Fire sheets).
+    /// </summary>
+    public sealed class TextNoteRule
+    {
+        public bool Enabled { get; set; } = true;
+        public string SheetFilter { get; set; } = "*";
+        public TextNoteScope Scope { get; set; } = TextNoteScope.SheetsPlacedViewsAndLegends;
+        public string NoteContains { get; set; } = string.Empty;
+        public string FindPattern { get; set; } = string.Empty;
+        public bool IsRegex { get; set; } = true;
+        public string ReplaceWith { get; set; } = string.Empty;
+        public string Notes { get; set; } = string.Empty;
+
+        public TextNoteRule Clone() => new()
+        {
+            Enabled = this.Enabled,
+            SheetFilter = this.SheetFilter,
+            Scope = this.Scope,
+            NoteContains = this.NoteContains,
+            FindPattern = this.FindPattern,
+            IsRegex = this.IsRegex,
+            ReplaceWith = this.ReplaceWith,
+            Notes = this.Notes
+        };
+
+        public static TextNoteRule CreateDefaultTiuInertGasRule() => new()
+        {
+            Enabled = true,
+            SheetFilter = "*TIU*",
+            Scope = TextNoteScope.SheetsPlacedViewsAndLegends,
+            NoteContains = "INERT GAS SYSTEM",
+            FindPattern = "P00100087-DAR-MIF-[A-Z0-9]+",
+            IsRegex = true,
+            ReplaceWith = @"=[ProjectNumber]&""-""&[Originator]&""-MIF-""&[Location]",
+            Notes = "Update Mechanical Inert Gas drawing locator on TIU fire sheets"
+        };
+    }
+
     /// <summary>
     /// A configurable parameter assignment or Excel-like formula rule attached to a TradeProfile.
     /// </summary>

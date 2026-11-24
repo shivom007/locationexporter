@@ -68,6 +68,10 @@ namespace RevitLocationExporter.Configuration
                     "OST_FireAlarmDevices", "OST_DataDevices", "OST_SecurityDevices",
                     "OST_TelephoneDevices", "OST_AudioVisualDevices", "OST_CommunicationDevices",
                     "OST_CableTray", "OST_CableTrayFitting", "OST_Conduit", "OST_ConduitFitting"
+                },
+                TextNoteRules = new()
+                {
+                    TextNoteRule.CreateDefaultTiuInertGasRule()
                 }
             };
 

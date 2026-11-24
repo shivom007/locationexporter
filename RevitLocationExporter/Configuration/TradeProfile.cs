@@ -96,6 +96,9 @@ namespace RevitLocationExporter.Configuration
         // ── Parameter & Formula Rules ────────────────────────────────────────
         public List<ParameterRule> ParameterRules { get; set; } = new();
 
+        // ── Sheet TextNote Rules ─────────────────────────────────────────────
+        public List<TextNoteRule> TextNoteRules { get; set; } = new();
+
         // ── Linked Excel Sync State ──────────────────────────────────────────
         public string LinkedExcelPath { get; set; } = string.Empty;
         public bool AutoSyncExcelOnRun { get; set; } = true;
@@ -129,6 +132,7 @@ namespace RevitLocationExporter.Configuration
             TargetCategoryNames ??= new List<string>();
             SheetDeletePatterns ??= new List<string> { "210001_EN" };
             ParameterRules ??= new List<ParameterRule>();
+            TextNoteRules ??= new List<TextNoteRule>();
 
             if (ProjectInfoData == null || ProjectInfoData.Count == 0)
             {
@@ -293,6 +297,9 @@ namespace RevitLocationExporter.Configuration
                 DefaultExportDwg = this.DefaultExportDwg,
                 DefaultEnforceModelStandards = this.DefaultEnforceModelStandards,
                 ParameterRules = (this.ParameterRules ?? new List<ParameterRule>())
+                    .Select(r => r.Clone())
+                    .ToList(),
+                TextNoteRules = (this.TextNoteRules ?? new List<TextNoteRule>())
                     .Select(r => r.Clone())
                     .ToList(),
                 LinkedExcelPath = this.LinkedExcelPath,

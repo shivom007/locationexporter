@@ -15,6 +15,7 @@ namespace RevitLocationExporter.Core
         public string Message { get; set; } = string.Empty;
         public int ConfigSettingsUpdated { get; set; }
         public int ParameterRulesCount { get; set; }
+        public int TextNoteRulesCount { get; set; }
         public int ElementLocationsCount { get; set; }
         public int SheetLocationsCount { get; set; }
         public int SheetSpecificCount { get; set; }
@@ -159,6 +160,16 @@ namespace RevitLocationExporter.Core
                     {
                         report.ParameterRulesCount = profile.ParameterRules.Count;
                     }
+
+                    var textNotesWs = workbook.Worksheets.FirstOrDefault(w =>
+                        w.Name.Equals("TextNote_Rules", StringComparison.OrdinalIgnoreCase) ||
+                        w.Name.Equals("TextNoteRules", StringComparison.OrdinalIgnoreCase));
+
+                    if (textNotesWs != null)
+                    {
+                        profile.TextNoteRules = ReadTextNoteRulesWorksheet(textNotesWs, report.Warnings);
+                    }
+                    report.TextNoteRulesCount = profile.TextNoteRules.Count;
                 }
 
                 // 2. Read all data tabs (Element_Params, Sheet_Params, Sheet_Specific_Params, Standards_Fill, Export_Locations)
@@ -178,8 +189,9 @@ namespace RevitLocationExporter.Core
                 profile.InvalidateFilter();
 
                 report.Success = true;
+                string tnPart = report.TextNoteRulesCount > 0 ? $", {report.TextNoteRulesCount} text note rule(s)" : "";
                 report.Message =
-                    $"{report.ConfigSettingsUpdated} config item(s), {report.ParameterRulesCount} parameter rule(s), " +
+                    $"{report.ConfigSettingsUpdated} config item(s), {report.ParameterRulesCount} parameter rule(s){tnPart}, " +
                     $"{report.ElementLocationsCount} element location(s), {report.SheetLocationsCount} sheet location(s), " +
                     $"{report.SheetSpecificCount} sheet-specific row(s), {report.ExportLocationsCount} export destination(s).";
             }
@@ -452,6 +464,104 @@ namespace RevitLocationExporter.Core
             return rules;
         }
 
+        private static List<TextNoteRule> ReadTextNoteRulesWorksheet(IXLWorksheet ws, List<string> warnings)
+        {
+            var rules = new List<TextNoteRule>();
+            var firstRow = ws.FirstRowUsed();
+            if (firstRow == null) return rules;
+
+            int enabledCol = -1, sheetCol = -1, scopeCol = -1, containsCol = -1, findCol = -1, regexCol = -1, replaceCol = -1, notesCol = -1;
+
+            foreach (var cell in firstRow.CellsUsed())
+            {
+                string h = cell.GetString().Trim().ToLowerInvariant();
+                int col = cell.Address.ColumnNumber;
+                if (h == "enabled" || h == "on") enabledCol = col;
+                else if (h.Contains("sheet")) sheetCol = col;
+                else if (h == "scope") scopeCol = col;
+                else if (h.Contains("contain")) containsCol = col;
+                else if (h.Contains("find") || h == "pattern") findCol = col;
+                else if (h.Contains("regex")) regexCol = col;
+                else if (h.Contains("replace")) replaceCol = col;
+                else if (h.Contains("note")) notesCol = col;
+            }
+
+            if (findCol == -1) findCol = 5;
+            if (replaceCol == -1) replaceCol = 7;
+
+            int lastRow = ws.LastRowUsed()?.RowNumber() ?? 0;
+            for (int r = firstRow.RowNumber() + 1; r <= lastRow; r++)
+            {
+                var row = ws.Row(r);
+                if (row.IsEmpty()) continue;
+
+                var findCell = row.Cell(findCol);
+                string findPattern = findCell.HasFormula
+                    ? "=" + (findCell.FormulaA1 ?? string.Empty).Trim()
+                    : (findCell.GetString() ?? string.Empty).Trim();
+
+                if (string.IsNullOrWhiteSpace(findPattern)) continue;
+
+                bool enabled = true;
+                if (enabledCol > 0)
+                {
+                    string enStr = LocationDataSheetReader.ReadCellTextSafe(row.Cell(enabledCol));
+                    if (!string.IsNullOrWhiteSpace(enStr) && TryParseBool(enStr, out bool b))
+                        enabled = b;
+                }
+
+                string sheetFilter = sheetCol > 0 ? LocationDataSheetReader.ReadCellTextSafe(row.Cell(sheetCol)) : "*";
+                if (string.IsNullOrWhiteSpace(sheetFilter)) sheetFilter = "*";
+
+                var scope = TextNoteScope.SheetsPlacedViewsAndLegends;
+                if (scopeCol > 0)
+                {
+                    string sStr = LocationDataSheetReader.ReadCellTextSafe(row.Cell(scopeCol)).Replace(" ", "");
+                    if (!string.IsNullOrWhiteSpace(sStr) && Enum.TryParse<TextNoteScope>(sStr, true, out var parsedS))
+                        scope = parsedS;
+                    else if (!string.IsNullOrWhiteSpace(sStr))
+                        warnings.Add($"TextNote_Rules row {r}: unrecognized Scope '{sStr}', defaulting to SheetsPlacedViewsAndLegends.");
+                }
+
+                string noteContains = containsCol > 0 ? LocationDataSheetReader.ReadCellTextSafe(row.Cell(containsCol)) : string.Empty;
+
+                bool isRegex = true;
+                if (regexCol > 0)
+                {
+                    string rxStr = LocationDataSheetReader.ReadCellTextSafe(row.Cell(regexCol));
+                    if (!string.IsNullOrWhiteSpace(rxStr) && TryParseBool(rxStr, out bool rxB))
+                        isRegex = rxB;
+                }
+
+                var repCell = row.Cell(replaceCol);
+                string replaceWith = repCell.HasFormula
+                    ? "=" + (repCell.FormulaA1 ?? string.Empty).Trim()
+                    : (repCell.GetString() ?? string.Empty).Trim();
+
+                string notes = notesCol > 0 ? LocationDataSheetReader.ReadCellTextSafe(row.Cell(notesCol)) : string.Empty;
+
+                if (replaceWith.StartsWith("=", StringComparison.Ordinal) &&
+                    !ExcelFormulaEngine.Validate(replaceWith, out string? ferr, out _))
+                {
+                    warnings.Add($"TextNote_Rules row {r}: replacement formula warning — {ferr}");
+                }
+
+                rules.Add(new TextNoteRule
+                {
+                    Enabled = enabled,
+                    SheetFilter = sheetFilter,
+                    Scope = scope,
+                    NoteContains = noteContains,
+                    FindPattern = findPattern,
+                    IsRegex = isRegex,
+                    ReplaceWith = replaceWith,
+                    Notes = notes
+                });
+            }
+
+            return rules;
+        }
+
         // ── Excel Template Export ────────────────────────────────────────────
 
         public static void ExportToExcelTemplate(TradeProfile profile, string targetPath)
@@ -582,6 +692,50 @@ namespace RevitLocationExporter.Core
                 expRows.Add(new[] { "AFNXIEELS", @"C:\Export\WP04", "Sample export destination" });
             }
             WriteStyledSheet(wsExp, new[] { "Locator Code", "Export_Folder", "Description" }, expRows);
+
+            // 8. TextNote_Rules
+            var wsTn = wb.AddWorksheet("TextNote_Rules");
+            var tnRows = new List<string[]>();
+            if (profile.TextNoteRules.Count > 0)
+            {
+                foreach (var r in profile.TextNoteRules)
+                {
+                    tnRows.Add(new[]
+                    {
+                        r.Enabled ? "TRUE" : "FALSE",
+                        string.IsNullOrWhiteSpace(r.SheetFilter) ? "*" : r.SheetFilter,
+                        r.Scope.ToString(),
+                        r.NoteContains,
+                        r.FindPattern,
+                        r.IsRegex ? "TRUE" : "FALSE",
+                        r.ReplaceWith,
+                        r.Notes
+                    });
+                }
+            }
+            else
+            {
+                var sample = TextNoteRule.CreateDefaultTiuInertGasRule();
+                tnRows.Add(new[]
+                {
+                    "FALSE",
+                    sample.SheetFilter,
+                    sample.Scope.ToString(),
+                    sample.NoteContains,
+                    sample.FindPattern,
+                    sample.IsRegex ? "TRUE" : "FALSE",
+                    sample.ReplaceWith,
+                    sample.Notes + " (sample — set Enabled=TRUE to activate)"
+                });
+            }
+            WriteStyledSheet(
+                wsTn,
+                new[] { "Enabled", "SheetFilter", "Scope", "NoteContains", "FindPattern", "IsRegex", "ReplaceWith", "Notes" },
+                tnRows,
+                textCols: new[] { 5, 7 });
+            wsTn.Range("A2:A200").CreateDataValidation().List("\"TRUE,FALSE\"", true);
+            wsTn.Range("C2:C200").CreateDataValidation().List("\"SheetsOnly,SheetsAndPlacedViews,SheetsPlacedViewsAndLegends\"", true);
+            wsTn.Range("F2:F200").CreateDataValidation().List("\"TRUE,FALSE\"", true);
 
             wb.SaveAs(targetPath);
         }
