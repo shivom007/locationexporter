@@ -1767,7 +1767,7 @@ namespace RevitLocationExporter.Commands
                     if (locContexts.Count == 0) continue;
 
                     // Compute WorksetConfiguration ONCE per source file
-                    OpenOptions openOpts = BuildOpenOptions(rvtPath, worksetOptions, trade, log);
+                    using OpenOptions openOpts = BuildOpenOptions(rvtPath, worksetOptions, trade, log);
 
                     if (locContexts.Count == 1)
                     {
@@ -1795,10 +1795,11 @@ namespace RevitLocationExporter.Commands
                             log.Error(ctx.Name, $"[{fileName}] {ex.Message}");
                         }
                     }
-                    else if (!options.SaveCentralRvt)
+                    else if (!options.SaveCentralRvt && !options.ExportNwc)
                     {
-                        // Hybrid Fast Path (2+ locations, SaveCentralRvt OFF):
-                        // Open heavy model ONCE, commit one-time pre-clean baseline, then isolate each location via TransactionGroup.RollBack()
+                        // Hybrid Fast Path (2+ locations, SaveCentralRvt OFF and ExportNwc OFF):
+                        // Open heavy model ONCE, commit one-time pre-clean baseline, then isolate each location via TransactionGroup.RollBack().
+                        // NWC export (NavisworksExportOptions) must run outside any active TransactionGroup, so multi-location NWC runs route to Hybrid Staged Path.
                         log.Info(fileName, $"Hybrid In-Memory mode: opening once for {locContexts.Count} location(s) (zero re-opens).");
                         try
                         {
@@ -1843,15 +1844,15 @@ namespace RevitLocationExporter.Commands
                     }
                     else
                     {
-                        // Hybrid Staged Path (2+ locations, SaveCentralRvt ON):
-                        // Open heavy model ONCE -> pre-clean & compact to fast local SSD temp copy -> extract each location cleanly
+                        // Hybrid Staged Path (2+ locations, SaveCentralRvt ON or ExportNwc ON):
+                        // Open heavy model ONCE -> pre-clean & compact to fast local SSD temp copy -> extract each location cleanly outside TransactionGroup
                         string tempStageDir = Path.Combine(Path.GetTempPath(), $"RevitLocStage_{Guid.NewGuid():N}");
                         Directory.CreateDirectory(tempStageDir);
                         string stagedPath = Path.Combine(tempStageDir, fileName);
                         ModelPath stagedModelPath;
-                        OpenOptions stagedOpenOpts;
+                        bool stagedIsWorkshared = false;
 
-                        log.Info(fileName, $"Hybrid Staged mode: pre-cleaning and compacting '{fileName}' once for {locContexts.Count} central RVT export(s).");
+                        log.Info(fileName, $"Hybrid Staged mode: pre-cleaning and compacting '{fileName}' once for {locContexts.Count} location export(s).");
                         try
                         {
                             using (Document srcDoc = app.OpenDocumentFile(rvtPath, openOpts))
@@ -1860,18 +1861,17 @@ namespace RevitLocationExporter.Commands
                                 {
                                     PreCleanDocument(srcDoc, nativeModelLocator, log, trade, options);
 
+                                    stagedIsWorkshared = srcDoc.IsWorkshared;
                                     var stageSaveOpts = new SaveAsOptions
                                     {
                                         OverwriteExistingFile = true,
                                         Compact = true
                                     };
-                                    if (srcDoc.IsWorkshared)
+                                    if (stagedIsWorkshared)
                                     {
                                         stageSaveOpts.SetWorksharingOptions(new WorksharingSaveAsOptions { SaveAsCentral = true });
                                     }
                                     srcDoc.SaveAs(stagedPath, stageSaveOpts);
-                                    stagedModelPath = ModelPathUtils.ConvertUserVisiblePathToModelPath(stagedPath);
-                                    stagedOpenOpts = BuildOpenOptions(stagedModelPath, worksetOptions, trade, log, quiet: true);
                                     srcDoc.Close(false);
                                 }
                                 catch
@@ -1881,11 +1881,17 @@ namespace RevitLocationExporter.Commands
                                 }
                             }
 
-                            foreach (var ctx in locContexts)
+                            stagedModelPath = ModelPathUtils.ConvertUserVisiblePathToModelPath(stagedPath);
+
+                            for (int locIdx = 0; locIdx < locContexts.Count; locIdx++)
                             {
+                                var ctx = locContexts[locIdx];
                                 try
                                 {
-                                    using Document doc = app.OpenDocumentFile(stagedModelPath, stagedOpenOpts);
+                                    using OpenOptions locOpenOpts = stagedIsWorkshared
+                                        ? BuildOpenOptions(stagedModelPath, worksetOptions, trade, log, quiet: locIdx > 0)
+                                        : new OpenOptions { Audit = false };
+                                    using Document doc = app.OpenDocumentFile(stagedModelPath, locOpenOpts);
                                     try
                                     {
                                         RunLocationStepsOnOpenDoc(doc, stagedModelPath, nativeModelLocator, ctx.Name, ctx.ElemParams, ctx.SheetParams,
@@ -1990,7 +1996,7 @@ namespace RevitLocationExporter.Commands
                             wsConfig.Open(idsToOpen);
                             if (!quiet) log.Info(trade.TradeCode, $"Opened {idsToOpen.Count} of {allWorksets.Count} worksets (global config).");
                         }
-                        else if (!quiet)
+                        else
                         {
                             log.Warning(trade.TradeCode, "No worksets matched global workset configuration — opening model with all user worksets closed.");
                         }
@@ -2001,7 +2007,7 @@ namespace RevitLocationExporter.Commands
             }
             catch (Exception ex)
             {
-                if (!quiet) log.Warning(trade.TradeCode, $"Could not configure worksets before opening: {ex.Message}");
+                log.Warning(trade.TradeCode, $"Could not configure worksets before opening: {ex.Message}");
             }
 
             return opts;
@@ -2917,34 +2923,64 @@ namespace RevitLocationExporter.Commands
                     if (!exportViewIds.TryGetValue("NWC", out ElementId nwcViewId) || nwcViewId == ElementId.InvalidElementId)
                         throw new InvalidOperationException($"[{locationName}] NWC export view could not be created — export aborted.");
 
-                    string nwcFolder = Path.Combine(exportRoot, "NWC");
-                    Directory.CreateDirectory(nwcFolder);
+                    View3D? nwcView = doc.GetElement(nwcViewId) as View3D;
+                    bool hasVisibleModelGeometry = new FilteredElementCollector(doc, nwcViewId)
+                        .WhereElementIsNotElementType()
+                        .Any(e => e.Category != null
+                            && e.Category.CategoryType == CategoryType.Model
+                            && !(e is RevitLinkInstance)
+                            && !(e is ImportInstance));
 
-                    string nwcFileName = trade.FormatFileName(trade.NwcFileNameTemplate, effProjNum, effOrig, locationName);
-                    string nwcFullPath = Path.Combine(nwcFolder, nwcFileName + ".nwc");
-
-                    var navOpts = new NavisworksExportOptions
+                    if (!hasVisibleModelGeometry)
                     {
-                        ExportScope = NavisworksExportScope.View,
-                        ViewId = nwcViewId,
-                        ExportElementIds = true,
-                        ConvertElementProperties = true,
-                        ConvertLights = true,
-                        ConvertLinkedCADFormats = false,
-                        Coordinates = NavisworksCoordinates.Shared,
-                        Parameters = NavisworksParameters.All,
-                        ExportUrls = false,
-                        DivideFileIntoLevels = true,
-                        ExportLinks = false,
-                        ExportParts = false,
-                        ExportRoomAsAttribute = false,
-                        ExportRoomGeometry = false,
-                        FindMissingMaterials = true,
-                        FacetingFactor = 1
-                    };
+                        string wsDiag = string.Empty;
+                        if (doc.IsWorkshared)
+                        {
+                            try
+                            {
+                                var userWs = new FilteredWorksetCollector(doc)
+                                    .OfKind(WorksetKind.UserWorkset)
+                                    .ToWorksets();
+                                int openCount = userWs.Count(w => w.IsOpen);
+                                wsDiag = $" (open user worksets: {openCount}/{userWs.Count})";
+                            }
+                            catch { }
+                        }
 
-                    doc.Export(nwcFolder, nwcFileName, navOpts);
-                    log.Info(locationName, $"NWC exported → {nwcFullPath}");
+                        log.Warning(locationName,
+                            $"NWC export skipped: 3D view '{nwcView?.Name ?? nwcViewId.ToString()}' has no visible host model geometry{wsDiag}. Check workset selection or view visibility.");
+                    }
+                    else
+                    {
+                        string nwcFolder = Path.Combine(exportRoot, "NWC");
+                        Directory.CreateDirectory(nwcFolder);
+
+                        string nwcFileName = trade.FormatFileName(trade.NwcFileNameTemplate, effProjNum, effOrig, locationName);
+                        string nwcFullPath = Path.Combine(nwcFolder, nwcFileName + ".nwc");
+
+                        var navOpts = new NavisworksExportOptions
+                        {
+                            ExportScope = NavisworksExportScope.View,
+                            ViewId = nwcViewId,
+                            ExportElementIds = true,
+                            ConvertElementProperties = true,
+                            ConvertLights = true,
+                            ConvertLinkedCADFormats = false,
+                            Coordinates = NavisworksCoordinates.Shared,
+                            Parameters = NavisworksParameters.All,
+                            ExportUrls = false,
+                            DivideFileIntoLevels = true,
+                            ExportLinks = false,
+                            ExportParts = false,
+                            ExportRoomAsAttribute = false,
+                            ExportRoomGeometry = false,
+                            FindMissingMaterials = true,
+                            FacetingFactor = 1
+                        };
+
+                        doc.Export(nwcFolder, nwcFileName, navOpts);
+                        log.Info(locationName, $"NWC exported → {nwcFullPath}");
+                    }
                 }
             }
             finally
