@@ -3089,11 +3089,19 @@ namespace RevitLocationExporter.Commands
 
                     string currRev = string.Empty;
                     string currRevDate = string.Empty;
-                    ElementId currRevId = sheet.GetCurrentRevision();
-                    if (currRevId != ElementId.InvalidElementId && doc.GetElement(currRevId) is Revision revObj)
+                    try
                     {
-                        currRev = revObj.RevisionNumber ?? string.Empty;
-                        currRevDate = revObj.RevisionDate ?? string.Empty;
+                        ElementId currRevId = sheet.GetCurrentRevision();
+                        if (currRevId != ElementId.InvalidElementId)
+                        {
+                            currRev = sheet.GetRevisionNumberOnSheet(currRevId) ?? string.Empty;
+                            if (doc.GetElement(currRevId) is Revision revObj)
+                                currRevDate = revObj.RevisionDate ?? string.Empty;
+                        }
+                    }
+                    catch
+                    {
+                        // Optional revision metadata must never abort sheet/titleblock parameter updates
                     }
 
                     var sheetMetaTokens = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
