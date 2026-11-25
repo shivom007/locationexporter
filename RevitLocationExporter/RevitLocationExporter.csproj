@@ -25,7 +25,7 @@
 	  <Compile Remove="Commands\LocationSplitterCentral_v3.cs" />
 	</ItemGroup>
 
-	<!-- Revit 2024 API — Private=false means NOT copied to output (Revit owns these DLLs) -->
+	<!-- Revit 2024 built-in & .NET Framework references — Private=false means NOT copied to output -->
 	<ItemGroup>
 		<Reference Include="RevitAPI">
 			<HintPath>C:\Program Files\Autodesk\Revit 2024\RevitAPI.dll</HintPath>
@@ -35,15 +35,13 @@
 			<HintPath>C:\Program Files\Autodesk\Revit 2024\RevitAPIUI.dll</HintPath>
 			<Private>false</Private>
 		</Reference>
+		<Reference Include="Newtonsoft.Json">
+			<HintPath>C:\Program Files\Autodesk\Revit 2024\NewtonSoft.Json.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
 		<Reference Include="System.IO.Compression" />
 		<Reference Include="System.IO.Compression.FileSystem" />
 		<Reference Include="System.Xml.Linq" />
-	</ItemGroup>
-
-	<!-- NuGet packages — only what's actually used in the code -->
-	<ItemGroup>
-		<PackageReference Include="ClosedXML" Version="0.105.0" />
-		<PackageReference Include="System.Text.Json" Version="10.0.5" />
 	</ItemGroup>
 
 	<!-- Config & Template files -->

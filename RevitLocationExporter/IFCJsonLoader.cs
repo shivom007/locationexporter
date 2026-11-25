@@ -1,7 +1,7 @@
 ﻿using System;
 using System.IO;
-using System.Text.Json;
-using System.Text.Json.Nodes;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Autodesk.Revit.DB;
 
 namespace RevitLocationExporter
@@ -13,8 +13,8 @@ namespace RevitLocationExporter
             if (!File.Exists(jsonPath))
                 throw new FileNotFoundException("IFC JSON file not found.", jsonPath);
 
-            // Parse using System.Text.Json
-            JsonObject j = JsonNode.Parse(File.ReadAllText(jsonPath))!.AsObject();
+            // Parse using Revit built-in Newtonsoft.Json
+            JObject j = JObject.Parse(File.ReadAllText(jsonPath));
 
             IFCExportOptions o = new IFCExportOptions();
 
@@ -37,15 +37,15 @@ namespace RevitLocationExporter
 
             o.FileVersion = IFCVersion.IFC2x3CV2;
 
-            if (j.TryGetPropertyValue("SpaceBoundaries", out JsonNode? v2))
-                o.SpaceBoundaryLevel = v2!.GetValue<int>();
+            if (j.TryGetValue("SpaceBoundaries", out JToken? v2) && v2.Type != JTokenType.Null)
+                o.SpaceBoundaryLevel = v2.Value<int>();
 
-            if (j.TryGetPropertyValue("SplitWallsAndColumns", out JsonNode? v3))
-                o.WallAndColumnSplitting = v3!.GetValue<bool>();
+            if (j.TryGetValue("SplitWallsAndColumns", out JToken? v3) && v3.Type != JTokenType.Null)
+                o.WallAndColumnSplitting = v3.Value<bool>();
 
 
-            if (j.TryGetPropertyValue("ExportBaseQuantities", out JsonNode? v6))
-                o.ExportBaseQuantities = v6!.GetValue<bool>();
+            if (j.TryGetValue("ExportBaseQuantities", out JToken? v6) && v6.Type != JTokenType.Null)
+                o.ExportBaseQuantities = v6.Value<bool>();
 
             o.FilterViewId = ifcView.Id;
 
@@ -63,8 +63,8 @@ namespace RevitLocationExporter
                     "SplitWallsAndColumns" or "ExportBaseQuantities")
                     continue;
 
-                if (kv.Value != null)
-                    o.AddOption(key, kv.Value.ToJsonString());
+                if (kv.Value != null && kv.Value.Type != JTokenType.Null)
+                    o.AddOption(key, JsonConvert.SerializeObject(kv.Value, Formatting.None));
                 
             }
 

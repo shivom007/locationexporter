@@ -3,9 +3,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Text.Encodings.Web;
-using System.Text.Json;
-using System.Text.Json.Serialization;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Converters;
+using Newtonsoft.Json.Linq;
 
 namespace RevitLocationExporter.Configuration
 {
@@ -28,16 +28,15 @@ namespace RevitLocationExporter.Configuration
         /// <summary>The currently active/selected trade code (e.g. "TI0", "ME0", "EL0").</summary>
         public string ActiveTradeCode { get; set; } = "TI0";
 
-        private static JsonSerializerOptions CreateJsonOptions()
+        private static JsonSerializerSettings CreateJsonSettings()
         {
-            var opts = new JsonSerializerOptions
+            var settings = new JsonSerializerSettings
             {
-                PropertyNameCaseInsensitive = true,
-                WriteIndented = true,
-                Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                Formatting = Formatting.Indented,
+                ObjectCreationHandling = ObjectCreationHandling.Replace
             };
-            opts.Converters.Add(new JsonStringEnumConverter());
-            return opts;
+            settings.Converters.Add(new StringEnumConverter());
+            return settings;
         }
 
         public TradeConfigManager()
@@ -211,16 +210,17 @@ namespace RevitLocationExporter.Configuration
                     string json = File.ReadAllText(path);
                     if (string.IsNullOrWhiteSpace(json)) continue;
 
-                    using JsonDocument doc = JsonDocument.Parse(json);
-                    JsonElement root = doc.RootElement;
+                    var jsonSettings = CreateJsonSettings();
+                    var serializer = JsonSerializer.Create(jsonSettings);
+                    var root = JObject.Parse(json);
 
-                    var jsonOpts = CreateJsonOptions();
-
-                    if (root.TryGetProperty("Trades", out JsonElement tradesElement))
+                    if (root.TryGetValue("Trades", StringComparison.OrdinalIgnoreCase, out JToken? tradesToken) &&
+                        tradesToken is JObject tradesElement)
                     {
-                        foreach (JsonProperty tradeProp in tradesElement.EnumerateObject())
+                        foreach (JProperty tradeProp in tradesElement.Properties())
                         {
-                            var profile = JsonSerializer.Deserialize<TradeProfile>(tradeProp.Value.GetRawText(), jsonOpts);
+                            if (tradeProp.Value is not JObject) continue;
+                            var profile = tradeProp.Value.ToObject<TradeProfile>(serializer);
 
                             if (profile != null)
                             {
@@ -233,20 +233,22 @@ namespace RevitLocationExporter.Configuration
                         }
                     }
 
-                    if (root.TryGetProperty("ActiveTradeCode", out JsonElement activeTradeProp))
+                    if (root.TryGetValue("ActiveTradeCode", StringComparison.OrdinalIgnoreCase, out JToken? activeTradeToken))
                     {
-                        string? activeCode = activeTradeProp.GetString();
+                        string? activeCode = activeTradeToken.Type == JTokenType.Null ? null : activeTradeToken.ToString();
                         if (!string.IsNullOrWhiteSpace(activeCode) && Trades.ContainsKey(activeCode!))
                         {
                             ActiveTradeCode = activeCode!;
                         }
                     }
 
-                    if (root.TryGetProperty("DefaultProject", out JsonElement defProj))
-                        Settings.ProjectNumber = defProj.GetString() ?? Settings.ProjectNumber;
+                    if (root.TryGetValue("DefaultProject", StringComparison.OrdinalIgnoreCase, out JToken? defProj) &&
+                        defProj.Type != JTokenType.Null)
+                        Settings.ProjectNumber = defProj.ToString() ?? Settings.ProjectNumber;
 
-                    if (root.TryGetProperty("DefaultOriginator", out JsonElement defOrig))
-                        Settings.Originator = defOrig.GetString() ?? Settings.Originator;
+                    if (root.TryGetValue("DefaultOriginator", StringComparison.OrdinalIgnoreCase, out JToken? defOrig) &&
+                        defOrig.Type != JTokenType.Null)
+                        Settings.Originator = defOrig.ToString() ?? Settings.Originator;
 
                     break; // Loaded successfully from first available configuration file
                 }
@@ -275,7 +277,7 @@ namespace RevitLocationExporter.Configuration
                 Trades = Trades
             };
 
-            string json = JsonSerializer.Serialize(rootObj, CreateJsonOptions());
+            string json = JsonConvert.SerializeObject(rootObj, CreateJsonSettings());
             File.WriteAllText(filePath, json);
         }
 
@@ -287,7 +289,7 @@ namespace RevitLocationExporter.Configuration
             if (string.IsNullOrWhiteSpace(tradeCode) || !Trades.TryGetValue(tradeCode, out var profile))
                 throw new ArgumentException($"Trade profile '{tradeCode}' not found.");
 
-            string json = JsonSerializer.Serialize(profile, CreateJsonOptions());
+            string json = JsonConvert.SerializeObject(profile, CreateJsonSettings());
             File.WriteAllText(filePath, json);
         }
 
@@ -307,16 +309,18 @@ namespace RevitLocationExporter.Configuration
             try
             {
                 string json = File.ReadAllText(filePath);
-                using JsonDocument doc = JsonDocument.Parse(json);
-                JsonElement root = doc.RootElement;
-                var jsonOpts = CreateJsonOptions();
+                var jsonSettings = CreateJsonSettings();
+                var serializer = JsonSerializer.Create(jsonSettings);
+                var root = JObject.Parse(json);
 
                 // Case 1: Multi-trade config format
-                if (root.TryGetProperty("Trades", out JsonElement tradesElement))
+                if (root.TryGetValue("Trades", StringComparison.OrdinalIgnoreCase, out JToken? tradesToken) &&
+                    tradesToken is JObject tradesElement)
                 {
-                    foreach (JsonProperty tradeProp in tradesElement.EnumerateObject())
+                    foreach (JProperty tradeProp in tradesElement.Properties())
                     {
-                        var profile = JsonSerializer.Deserialize<TradeProfile>(tradeProp.Value.GetRawText(), jsonOpts);
+                        if (tradeProp.Value is not JObject) continue;
+                        var profile = tradeProp.Value.ToObject<TradeProfile>(serializer);
 
                         if (profile != null)
                         {
@@ -327,9 +331,9 @@ namespace RevitLocationExporter.Configuration
                         }
                     }
 
-                    if (root.TryGetProperty("ActiveTradeCode", out JsonElement activeTradeProp))
+                    if (root.TryGetValue("ActiveTradeCode", StringComparison.OrdinalIgnoreCase, out JToken? activeTradeToken))
                     {
-                        string? activeCode = activeTradeProp.GetString();
+                        string? activeCode = activeTradeToken.Type == JTokenType.Null ? null : activeTradeToken.ToString();
                         if (!string.IsNullOrWhiteSpace(activeCode) && Trades.ContainsKey(activeCode!))
                             ActiveTradeCode = activeCode!;
                     }
@@ -339,7 +343,7 @@ namespace RevitLocationExporter.Configuration
                 }
 
                 // Case 2: Single TradeProfile format
-                var singleProfile = JsonSerializer.Deserialize<TradeProfile>(json, jsonOpts);
+                var singleProfile = JsonConvert.DeserializeObject<TradeProfile>(json, jsonSettings);
 
                 if (singleProfile != null && !string.IsNullOrWhiteSpace(singleProfile.TradeCode))
                 {

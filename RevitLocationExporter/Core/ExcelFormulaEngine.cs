@@ -658,6 +658,8 @@ namespace RevitLocationExporter.Core
                     return new LiteralNode(tok.Text);
                 case TokenKind.Boolean:
                     p++;
+                    if (p + 1 < t.Count && t[p].Kind == TokenKind.LParen && t[p + 1].Kind == TokenKind.RParen)
+                        p += 2;
                     return new LiteralNode(tok.BoolValue);
                 case TokenKind.Reference:
                     p++;

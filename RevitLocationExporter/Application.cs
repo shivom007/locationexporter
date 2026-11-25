@@ -42,25 +42,28 @@ namespace RevitLocationExporter
             {
                 try
                 {
-                    string folder = System.IO.Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? string.Empty;
+                    var self = Assembly.GetExecutingAssembly();
+                    if (args.RequestingAssembly != null && args.RequestingAssembly != self)
+                        return null;
+
+                    string folder = System.IO.Path.GetDirectoryName(self.Location) ?? string.Empty;
                     if (string.IsNullOrEmpty(folder) || !System.IO.Directory.Exists(folder)) return null;
 
-                    string simpleName = new AssemblyName(args.Name).Name;
+                    var requested = new AssemblyName(args.Name);
+                    string simpleName = requested.Name ?? string.Empty;
                     if (string.IsNullOrEmpty(simpleName)) return null;
 
-                    foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-                    {
-                        if (string.Equals(asm.GetName().Name, simpleName, StringComparison.OrdinalIgnoreCase))
-                        {
-                            return asm;
-                        }
-                    }
-
                     string candidate = System.IO.Path.Combine(folder, simpleName + ".dll");
-                    if (System.IO.File.Exists(candidate))
-                    {
-                        return Assembly.LoadFrom(candidate);
-                    }
+                    if (!System.IO.File.Exists(candidate)) return null;
+
+                    var candidateName = AssemblyName.GetAssemblyName(candidate);
+                    if (!string.Equals(candidateName.Name, simpleName, StringComparison.OrdinalIgnoreCase))
+                        return null;
+
+                    if (requested.Version != null && candidateName.Version != requested.Version)
+                        return null;
+
+                    return Assembly.LoadFrom(candidate);
                 }
                 catch
                 {

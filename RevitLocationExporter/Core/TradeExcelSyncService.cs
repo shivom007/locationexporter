@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using ClosedXML.Excel;
 using RevitLocationExporter.Configuration;
 
 namespace RevitLocationExporter.Core
@@ -134,43 +133,41 @@ namespace RevitLocationExporter.Core
             {
                 profile.EnsureInitialized();
 
-                // 1. Read Trade_Config and Parameter_Rules via ClosedXML (FileShare.ReadWrite so Excel can stay open)
-                using (var fs = new FileStream(excelPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var workbook = new XLWorkbook(fs))
+                // 1. Read Trade_Config, Parameter_Rules, and TextNote_Rules via zero-dependency NativeXlsxEngine (FileShare.ReadWrite so Excel can stay open)
+                var workbook = NativeXlsxEngine.Open(excelPath);
+
+                var configWs = workbook.Sheets.FirstOrDefault(w =>
+                    w.Name.Equals("Trade_Config", StringComparison.OrdinalIgnoreCase) ||
+                    w.Name.Equals("TradeConfig", StringComparison.OrdinalIgnoreCase));
+
+                if (configWs != null)
                 {
-                    var configWs = workbook.Worksheets.FirstOrDefault(w =>
-                        w.Name.Equals("Trade_Config", StringComparison.OrdinalIgnoreCase) ||
-                        w.Name.Equals("TradeConfig", StringComparison.OrdinalIgnoreCase));
-
-                    if (configWs != null)
-                    {
-                        report.ConfigSettingsUpdated = ReadTradeConfigWorksheet(configWs, profile, report.Warnings);
-                    }
-
-                    var rulesWs = workbook.Worksheets.FirstOrDefault(w =>
-                        w.Name.Equals("Parameter_Rules", StringComparison.OrdinalIgnoreCase) ||
-                        w.Name.Equals("ParameterRules", StringComparison.OrdinalIgnoreCase));
-
-                    if (rulesWs != null)
-                    {
-                        profile.ParameterRules = ReadParameterRulesWorksheet(rulesWs, report.Warnings);
-                        report.ParameterRulesCount = profile.ParameterRules.Count;
-                    }
-                    else
-                    {
-                        report.ParameterRulesCount = profile.ParameterRules.Count;
-                    }
-
-                    var textNotesWs = workbook.Worksheets.FirstOrDefault(w =>
-                        w.Name.Equals("TextNote_Rules", StringComparison.OrdinalIgnoreCase) ||
-                        w.Name.Equals("TextNoteRules", StringComparison.OrdinalIgnoreCase));
-
-                    if (textNotesWs != null)
-                    {
-                        profile.TextNoteRules = ReadTextNoteRulesWorksheet(textNotesWs, report.Warnings);
-                    }
-                    report.TextNoteRulesCount = profile.TextNoteRules.Count;
+                    report.ConfigSettingsUpdated = ReadTradeConfigWorksheet(configWs, profile, report.Warnings);
                 }
+
+                var rulesWs = workbook.Sheets.FirstOrDefault(w =>
+                    w.Name.Equals("Parameter_Rules", StringComparison.OrdinalIgnoreCase) ||
+                    w.Name.Equals("ParameterRules", StringComparison.OrdinalIgnoreCase));
+
+                if (rulesWs != null)
+                {
+                    profile.ParameterRules = ReadParameterRulesWorksheet(rulesWs, report.Warnings);
+                    report.ParameterRulesCount = profile.ParameterRules.Count;
+                }
+                else
+                {
+                    report.ParameterRulesCount = profile.ParameterRules.Count;
+                }
+
+                var textNotesWs = workbook.Sheets.FirstOrDefault(w =>
+                    w.Name.Equals("TextNote_Rules", StringComparison.OrdinalIgnoreCase) ||
+                    w.Name.Equals("TextNoteRules", StringComparison.OrdinalIgnoreCase));
+
+                if (textNotesWs != null)
+                {
+                    profile.TextNoteRules = ReadTextNoteRulesWorksheet(textNotesWs, report.Warnings);
+                }
+                report.TextNoteRulesCount = profile.TextNoteRules.Count;
 
                 // 2. Read all data tabs (Element_Params, Sheet_Params, Sheet_Specific_Params, Standards_Fill, Export_Locations)
                 var bundle = LocationDataSheetReader.ReadParameterBundle(excelPath);
@@ -204,37 +201,35 @@ namespace RevitLocationExporter.Core
             return report;
         }
 
-        private static int ReadTradeConfigWorksheet(IXLWorksheet ws, TradeProfile profile, List<string> warnings)
+        private static int ReadTradeConfigWorksheet(NativeWorksheet ws, TradeProfile profile, List<string> warnings)
         {
-            var firstRow = ws.FirstRowUsed();
-            if (firstRow == null) return 0;
+            int firstRow = ws.FirstNonEmptyRowNumber();
+            if (firstRow == 0) return 0;
 
             int settingCol = 1;
             int valueCol = 2;
 
-            foreach (var cell in firstRow.CellsUsed())
+            foreach (int col in ws.GetUsedColumnsInRow(firstRow))
             {
-                string h = cell.GetString().Trim();
+                string h = ws.GetEvaluatedText(firstRow, col);
                 if (h.Equals("Setting", StringComparison.OrdinalIgnoreCase) ||
                     h.Equals("Key", StringComparison.OrdinalIgnoreCase) ||
                     h.Equals("Name", StringComparison.OrdinalIgnoreCase))
-                    settingCol = cell.Address.ColumnNumber;
+                    settingCol = col;
                 else if (h.Equals("Value", StringComparison.OrdinalIgnoreCase))
-                    valueCol = cell.Address.ColumnNumber;
+                    valueCol = col;
             }
 
             int updated = 0;
-            int lastRow = ws.LastRowUsed()?.RowNumber() ?? 0;
 
-            for (int r = firstRow.RowNumber() + 1; r <= lastRow; r++)
+            for (int r = firstRow + 1; r <= ws.MaxRow; r++)
             {
-                var row = ws.Row(r);
-                if (row.IsEmpty()) continue;
+                if (ws.IsRowEmpty(r)) continue;
 
-                string key = LocationDataSheetReader.ReadCellTextSafe(row.Cell(settingCol));
+                string key = ws.GetEvaluatedText(r, settingCol);
                 if (string.IsNullOrWhiteSpace(key)) continue;
 
-                string val = LocationDataSheetReader.ReadCellTextSafe(row.Cell(valueCol));
+                string val = ws.GetEvaluatedText(r, valueCol);
 
                 if (key.StartsWith("ProjectInfo:", StringComparison.OrdinalIgnoreCase))
                 {
@@ -363,18 +358,17 @@ namespace RevitLocationExporter.Core
             return updated;
         }
 
-        private static List<ParameterRule> ReadParameterRulesWorksheet(IXLWorksheet ws, List<string> warnings)
+        private static List<ParameterRule> ReadParameterRulesWorksheet(NativeWorksheet ws, List<string> warnings)
         {
             var rules = new List<ParameterRule>();
-            var firstRow = ws.FirstRowUsed();
-            if (firstRow == null) return rules;
+            int firstRow = ws.FirstNonEmptyRowNumber();
+            if (firstRow == 0) return rules;
 
             int enabledCol = -1, targetCol = -1, filterCol = -1, paramCol = -1, valCol = -1, modeCol = -1, notesCol = -1;
 
-            foreach (var cell in firstRow.CellsUsed())
+            foreach (int col in ws.GetUsedColumnsInRow(firstRow))
             {
-                string h = cell.GetString().Trim().ToLowerInvariant();
-                int col = cell.Address.ColumnNumber;
+                string h = ws.GetEvaluatedText(firstRow, col).ToLowerInvariant();
                 if (h == "enabled" || h == "on") enabledCol = col;
                 else if (h == "target" || h == "scope") targetCol = col;
                 else if (h == "filter" || h == "category") filterCol = col;
@@ -387,25 +381,20 @@ namespace RevitLocationExporter.Core
             if (paramCol == -1) paramCol = 4;
             if (valCol == -1) valCol = 5;
 
-            int lastRow = ws.LastRowUsed()?.RowNumber() ?? 0;
-            for (int r = firstRow.RowNumber() + 1; r <= lastRow; r++)
+            for (int r = firstRow + 1; r <= ws.MaxRow; r++)
             {
-                var row = ws.Row(r);
-                if (row.IsEmpty()) continue;
+                if (ws.IsRowEmpty(r)) continue;
 
-                string paramName = LocationDataSheetReader.ReadCellTextSafe(row.Cell(paramCol));
+                string paramName = ws.GetEvaluatedText(r, paramCol);
                 if (string.IsNullOrWhiteSpace(paramName)) continue;
 
-                // For Value_Or_Formula, read verbatim text; if user stored it as Excel formula, recover "=" + FormulaA1
-                var valCell = row.Cell(valCol);
-                string valueOrFormula = valCell.HasFormula
-                    ? "=" + (valCell.FormulaA1 ?? string.Empty).Trim()
-                    : (valCell.GetString() ?? string.Empty).Trim();
+                // For Value_Or_Formula, preserve '=' formula text verbatim
+                string valueOrFormula = ws.GetFormulaOrText(r, valCol);
 
                 bool enabled = true;
                 if (enabledCol > 0)
                 {
-                    string enStr = LocationDataSheetReader.ReadCellTextSafe(row.Cell(enabledCol));
+                    string enStr = ws.GetEvaluatedText(r, enabledCol);
                     if (!string.IsNullOrWhiteSpace(enStr) && TryParseBool(enStr, out bool b))
                         enabled = b;
                 }
@@ -413,22 +402,20 @@ namespace RevitLocationExporter.Core
                 var target = ParameterRuleTarget.Element;
                 if (targetCol > 0)
                 {
-                    string tStr = LocationDataSheetReader.ReadCellTextSafe(row.Cell(targetCol)).Replace(" ", "");
+                    string tStr = ws.GetEvaluatedText(r, targetCol).Replace(" ", "");
                     if (!string.IsNullOrWhiteSpace(tStr) && Enum.TryParse<ParameterRuleTarget>(tStr, true, out var parsedT))
                         target = parsedT;
                     else if (!string.IsNullOrWhiteSpace(tStr))
                         warnings.Add($"Parameter_Rules row {r}: unrecognized Target '{tStr}', defaulting to Element.");
                 }
 
-                string filter = filterCol > 0
-                    ? LocationDataSheetReader.ReadCellTextSafe(row.Cell(filterCol))
-                    : "*";
+                string filter = filterCol > 0 ? ws.GetEvaluatedText(r, filterCol) : "*";
                 if (string.IsNullOrWhiteSpace(filter)) filter = "*";
 
                 var mode = ParameterFillMode.Overwrite;
                 if (modeCol > 0)
                 {
-                    string mStr = LocationDataSheetReader.ReadCellTextSafe(row.Cell(modeCol)).Replace(" ", "");
+                    string mStr = ws.GetEvaluatedText(r, modeCol).Replace(" ", "");
                     if (!string.IsNullOrWhiteSpace(mStr))
                     {
                         if (mStr.Equals("FillIfEmpty", StringComparison.OrdinalIgnoreCase) ||
@@ -439,9 +426,7 @@ namespace RevitLocationExporter.Core
                     }
                 }
 
-                string notes = notesCol > 0
-                    ? LocationDataSheetReader.ReadCellTextSafe(row.Cell(notesCol))
-                    : string.Empty;
+                string notes = notesCol > 0 ? ws.GetEvaluatedText(r, notesCol) : string.Empty;
 
                 if (valueOrFormula.StartsWith("=", StringComparison.Ordinal) &&
                     !ExcelFormulaEngine.Validate(valueOrFormula, out string? ferr, out _))
@@ -464,18 +449,17 @@ namespace RevitLocationExporter.Core
             return rules;
         }
 
-        private static List<TextNoteRule> ReadTextNoteRulesWorksheet(IXLWorksheet ws, List<string> warnings)
+        private static List<TextNoteRule> ReadTextNoteRulesWorksheet(NativeWorksheet ws, List<string> warnings)
         {
             var rules = new List<TextNoteRule>();
-            var firstRow = ws.FirstRowUsed();
-            if (firstRow == null) return rules;
+            int firstRow = ws.FirstNonEmptyRowNumber();
+            if (firstRow == 0) return rules;
 
             int enabledCol = -1, sheetCol = -1, scopeCol = -1, containsCol = -1, findCol = -1, regexCol = -1, replaceCol = -1, notesCol = -1;
 
-            foreach (var cell in firstRow.CellsUsed())
+            foreach (int col in ws.GetUsedColumnsInRow(firstRow))
             {
-                string h = cell.GetString().Trim().ToLowerInvariant();
-                int col = cell.Address.ColumnNumber;
+                string h = ws.GetEvaluatedText(firstRow, col).ToLowerInvariant();
                 if (h == "enabled" || h == "on") enabledCol = col;
                 else if (h.Contains("sheet")) sheetCol = col;
                 else if (h == "scope") scopeCol = col;
@@ -489,56 +473,46 @@ namespace RevitLocationExporter.Core
             if (findCol == -1) findCol = 5;
             if (replaceCol == -1) replaceCol = 7;
 
-            int lastRow = ws.LastRowUsed()?.RowNumber() ?? 0;
-            for (int r = firstRow.RowNumber() + 1; r <= lastRow; r++)
+            for (int r = firstRow + 1; r <= ws.MaxRow; r++)
             {
-                var row = ws.Row(r);
-                if (row.IsEmpty()) continue;
+                if (ws.IsRowEmpty(r)) continue;
 
-                var findCell = row.Cell(findCol);
-                string findPattern = findCell.HasFormula
-                    ? "=" + (findCell.FormulaA1 ?? string.Empty).Trim()
-                    : (findCell.GetString() ?? string.Empty).Trim();
-
+                string findPattern = ws.GetFormulaOrText(r, findCol);
                 if (string.IsNullOrWhiteSpace(findPattern)) continue;
 
                 bool enabled = true;
                 if (enabledCol > 0)
                 {
-                    string enStr = LocationDataSheetReader.ReadCellTextSafe(row.Cell(enabledCol));
+                    string enStr = ws.GetEvaluatedText(r, enabledCol);
                     if (!string.IsNullOrWhiteSpace(enStr) && TryParseBool(enStr, out bool b))
                         enabled = b;
                 }
 
-                string sheetFilter = sheetCol > 0 ? LocationDataSheetReader.ReadCellTextSafe(row.Cell(sheetCol)) : "*";
+                string sheetFilter = sheetCol > 0 ? ws.GetEvaluatedText(r, sheetCol) : "*";
                 if (string.IsNullOrWhiteSpace(sheetFilter)) sheetFilter = "*";
 
                 var scope = TextNoteScope.SheetsPlacedViewsAndLegends;
                 if (scopeCol > 0)
                 {
-                    string sStr = LocationDataSheetReader.ReadCellTextSafe(row.Cell(scopeCol)).Replace(" ", "");
+                    string sStr = ws.GetEvaluatedText(r, scopeCol).Replace(" ", "");
                     if (!string.IsNullOrWhiteSpace(sStr) && Enum.TryParse<TextNoteScope>(sStr, true, out var parsedS))
                         scope = parsedS;
                     else if (!string.IsNullOrWhiteSpace(sStr))
                         warnings.Add($"TextNote_Rules row {r}: unrecognized Scope '{sStr}', defaulting to SheetsPlacedViewsAndLegends.");
                 }
 
-                string noteContains = containsCol > 0 ? LocationDataSheetReader.ReadCellTextSafe(row.Cell(containsCol)) : string.Empty;
+                string noteContains = containsCol > 0 ? ws.GetEvaluatedText(r, containsCol) : string.Empty;
 
                 bool isRegex = true;
                 if (regexCol > 0)
                 {
-                    string rxStr = LocationDataSheetReader.ReadCellTextSafe(row.Cell(regexCol));
+                    string rxStr = ws.GetEvaluatedText(r, regexCol);
                     if (!string.IsNullOrWhiteSpace(rxStr) && TryParseBool(rxStr, out bool rxB))
                         isRegex = rxB;
                 }
 
-                var repCell = row.Cell(replaceCol);
-                string replaceWith = repCell.HasFormula
-                    ? "=" + (repCell.FormulaA1 ?? string.Empty).Trim()
-                    : (repCell.GetString() ?? string.Empty).Trim();
-
-                string notes = notesCol > 0 ? LocationDataSheetReader.ReadCellTextSafe(row.Cell(notesCol)) : string.Empty;
+                string replaceWith = ws.GetFormulaOrText(r, replaceCol);
+                string notes = notesCol > 0 ? ws.GetEvaluatedText(r, notesCol) : string.Empty;
 
                 if (replaceWith.StartsWith("=", StringComparison.Ordinal) &&
                     !ExcelFormulaEngine.Validate(replaceWith, out string? ferr, out _))
@@ -568,10 +542,9 @@ namespace RevitLocationExporter.Core
         {
             profile.EnsureInitialized();
 
-            using var wb = new XLWorkbook();
+            var sheets = new List<NativeSheetSpec>();
 
             // 1. Trade_Config
-            var wsConfig = wb.AddWorksheet("Trade_Config");
             var configRows = new List<string[]>
             {
                 new[] { "TradeCode", profile.TradeCode, "ISO 19650 filename segment 2 trade abbreviation" },
@@ -600,10 +573,15 @@ namespace RevitLocationExporter.Core
             {
                 configRows.Add(new[] { $"ProjectInfo:{kv.Key}", kv.Value, "Project Information parameter" });
             }
-            WriteStyledSheet(wsConfig, new[] { "Setting", "Value", "Notes" }, configRows, textCols: new[] { 2 });
+            sheets.Add(new NativeSheetSpec
+            {
+                Name = "Trade_Config",
+                Headers = new[] { "Setting", "Value", "Notes" },
+                Rows = configRows,
+                TextColumns = new HashSet<int> { 2 }
+            });
 
             // 2. Parameter_Rules
-            var wsRules = wb.AddWorksheet("Parameter_Rules");
             var rulesRows = new List<string[]>();
             if (profile.ParameterRules.Count > 0)
             {
@@ -626,53 +604,54 @@ namespace RevitLocationExporter.Core
                 rulesRows.Add(new[] { "TRUE", "Element", "*", "CPK_Stage", "Projekt Budowlany", "FillIfEmpty", "Static default value" });
                 rulesRows.Add(new[] { "TRUE", "Element", "*", "CPK_WBS_Short", "=LEFT(RIGHT([CPK_WBS_5],2),1)&\".\"&RIGHT([CPK_WBS_5],1)", "Overwrite", "Example dependent formula (81 -> 8.1)" });
             }
-            WriteStyledSheet(
-                wsRules,
-                new[] { "Enabled", "Target", "Filter", "Parameter", "Value_Or_Formula", "Mode", "Notes" },
-                rulesRows,
-                textCols: new[] { 5 });
-            wsRules.Range("A2:A200").CreateDataValidation().List("\"TRUE,FALSE\"", true);
-            wsRules.Range("B2:B200").CreateDataValidation().List("\"Element,Sheet,Titleblock,SheetCover,ProjectInfo\"", true);
-            wsRules.Range("F2:F200").CreateDataValidation().List("\"Overwrite,FillIfEmpty\"", true);
+            sheets.Add(new NativeSheetSpec
+            {
+                Name = "Parameter_Rules",
+                Headers = new[] { "Enabled", "Target", "Filter", "Parameter", "Value_Or_Formula", "Mode", "Notes" },
+                Rows = rulesRows,
+                TextColumns = new HashSet<int> { 5 },
+                DataValidations =
+                {
+                    ("A2:A200", "\"TRUE,FALSE\""),
+                    ("B2:B200", "\"Element,Sheet,Titleblock,SheetCover,ProjectInfo\""),
+                    ("F2:F200", "\"Overwrite,FillIfEmpty\"")
+                }
+            });
 
             // 3. Element_Params
-            var wsElem = wb.AddWorksheet("Element_Params");
-            WriteKeyedMapSheet(
-                wsElem,
+            sheets.Add(BuildKeyedMapSheet(
+                "Element_Params",
                 "Locator Code",
                 profile.SyncedData?.ElementParameters,
                 fallbackHeaders: new[] { "Locator Code", "CPK_WBS_Name", "CPK_WBS_1-3", "CPK_WBS_4", "CPK_WBS_5" },
                 fallbackRows: new List<string[]>
                 {
                     new[] { "AFNXIEELS", "AGL Substations Main Midfield North West", "C.A.AI.NVL.10", "C.A.AI.NVL.10.CON", "C.A.AI.NVL.10.CON.81" }
-                });
+                }));
 
             // 4. Sheet_Params
-            var wsSheet = wb.AddWorksheet("Sheet_Params");
-            WriteKeyedMapSheet(
-                wsSheet,
+            sheets.Add(BuildKeyedMapSheet(
+                "Sheet_Params",
                 "Locator Code",
                 profile.SyncedData?.SheetParameters,
                 fallbackHeaders: new[] { "Locator Code", "Work_Package", "Building Name", "CPK_Location_Code", "CPK_RVT_File_Name" },
                 fallbackRows: new List<string[]>
                 {
                     new[] { "AFNXIEELS", "WP48", "AGL Substations Main Midfield North West", "AFNXIEELS", $"{profile.ProjectNumber}-{profile.Originator}-{profile.TradeCode}-AFNXIEELS-XX-M3-XX0001_PE" }
-                });
+                }));
 
             // 5. Sheet_Specific_Params
-            var wsSpec = wb.AddWorksheet("Sheet_Specific_Params");
-            WriteKeyedMapSheet(
-                wsSpec,
+            sheets.Add(BuildKeyedMapSheet(
+                "Sheet_Specific_Params",
                 "Sheet Number",
                 profile.SyncedData?.SheetNumberParameters,
                 fallbackHeaders: new[] { "Sheet Number", "Sheet Name", "Work_Package", "Revision", "Drawn By" },
                 fallbackRows: new List<string[]>
                 {
                     new[] { $"{profile.ProjectNumber}-{profile.Originator}-{profile.TradeCode}-AFNXIEELS-00-DR-0001_PL", "Main Midfield NW - Plan", "WP48", "P01", profile.Originator }
-                });
+                }));
 
             // 6. Standards_Fill
-            var wsStd = wb.AddWorksheet("Standards_Fill");
             var stdRows = (profile.SyncedData?.StandardsFillRows ?? new List<StandardsFillRowDto>())
                 .Select(r => new[] { r.Locator, r.Category, r.FamilyType, r.Parameter, r.Value })
                 .ToList();
@@ -680,10 +659,14 @@ namespace RevitLocationExporter.Core
             {
                 stdRows.Add(new[] { "*", "*", "*", "CPK_Stage", "Projekt Budowlany" });
             }
-            WriteStyledSheet(wsStd, new[] { "Locator Code", "Category", "Family Type", "Parameter", "Value" }, stdRows);
+            sheets.Add(new NativeSheetSpec
+            {
+                Name = "Standards_Fill",
+                Headers = new[] { "Locator Code", "Category", "Family Type", "Parameter", "Value" },
+                Rows = stdRows
+            });
 
             // 7. Export_Locations
-            var wsExp = wb.AddWorksheet("Export_Locations");
             var expRows = (profile.SyncedData?.ExportLocations ?? new Dictionary<string, string>())
                 .Select(kv => new[] { kv.Key, kv.Value, string.Empty })
                 .ToList();
@@ -691,10 +674,14 @@ namespace RevitLocationExporter.Core
             {
                 expRows.Add(new[] { "AFNXIEELS", @"C:\Export\WP04", "Sample export destination" });
             }
-            WriteStyledSheet(wsExp, new[] { "Locator Code", "Export_Folder", "Description" }, expRows);
+            sheets.Add(new NativeSheetSpec
+            {
+                Name = "Export_Locations",
+                Headers = new[] { "Locator Code", "Export_Folder", "Description" },
+                Rows = expRows
+            });
 
             // 8. TextNote_Rules
-            var wsTn = wb.AddWorksheet("TextNote_Rules");
             var tnRows = new List<string[]>();
             if (profile.TextNoteRules.Count > 0)
             {
@@ -728,20 +715,25 @@ namespace RevitLocationExporter.Core
                     sample.Notes + " (sample — set Enabled=TRUE to activate)"
                 });
             }
-            WriteStyledSheet(
-                wsTn,
-                new[] { "Enabled", "SheetFilter", "Scope", "NoteContains", "FindPattern", "IsRegex", "ReplaceWith", "Notes" },
-                tnRows,
-                textCols: new[] { 5, 7 });
-            wsTn.Range("A2:A200").CreateDataValidation().List("\"TRUE,FALSE\"", true);
-            wsTn.Range("C2:C200").CreateDataValidation().List("\"SheetsOnly,SheetsAndPlacedViews,SheetsPlacedViewsAndLegends\"", true);
-            wsTn.Range("F2:F200").CreateDataValidation().List("\"TRUE,FALSE\"", true);
+            sheets.Add(new NativeSheetSpec
+            {
+                Name = "TextNote_Rules",
+                Headers = new[] { "Enabled", "SheetFilter", "Scope", "NoteContains", "FindPattern", "IsRegex", "ReplaceWith", "Notes" },
+                Rows = tnRows,
+                TextColumns = new HashSet<int> { 5, 7 },
+                DataValidations =
+                {
+                    ("A2:A200", "\"TRUE,FALSE\""),
+                    ("C2:C200", "\"SheetsOnly,SheetsAndPlacedViews,SheetsPlacedViewsAndLegends\""),
+                    ("F2:F200", "\"TRUE,FALSE\"")
+                }
+            });
 
-            wb.SaveAs(targetPath);
+            NativeXlsxEngine.WriteWorkbook(targetPath, sheets);
         }
 
-        private static void WriteKeyedMapSheet(
-            IXLWorksheet ws,
+        private static NativeSheetSpec BuildKeyedMapSheet(
+            string sheetName,
             string keyHeader,
             Dictionary<string, Dictionary<string, string>>? data,
             string[] fallbackHeaders,
@@ -749,8 +741,12 @@ namespace RevitLocationExporter.Core
         {
             if (data == null || data.Count == 0)
             {
-                WriteStyledSheet(ws, fallbackHeaders, fallbackRows);
-                return;
+                return new NativeSheetSpec
+                {
+                    Name = sheetName,
+                    Headers = fallbackHeaders,
+                    Rows = fallbackRows
+                };
             }
 
             var dynamicCols = new List<string>();
@@ -779,70 +775,12 @@ namespace RevitLocationExporter.Core
                 rows.Add(arr);
             }
 
-            WriteStyledSheet(ws, headers.ToArray(), rows);
-        }
-
-        private static void WriteStyledSheet(IXLWorksheet ws, string[] headers, List<string[]> rows, int[]? textCols = null)
-        {
-            var textColSet = new HashSet<int>(textCols ?? Array.Empty<int>());
-            var headerBg = XLColor.FromHtml("#1F2937");
-            var zebraBg = XLColor.FromHtml("#F8FAFC");
-            var borderColor = XLColor.FromHtml("#D1D5DB");
-
-            ws.SheetView.FreezeRows(1);
-            ws.Row(1).Height = 22;
-
-            for (int c = 0; c < headers.Length; c++)
+            return new NativeSheetSpec
             {
-                var cell = ws.Cell(1, c + 1);
-                cell.Value = headers[c];
-                cell.Style.Fill.BackgroundColor = headerBg;
-                cell.Style.Font.FontName = "Segoe UI";
-                cell.Style.Font.FontSize = 10;
-                cell.Style.Font.Bold = true;
-                cell.Style.Font.FontColor = XLColor.White;
-                cell.Style.Border.OutsideBorder = XLBorderStyleValues.Thin;
-                cell.Style.Border.OutsideBorderColor = borderColor;
-                cell.Style.Alignment.Vertical = XLAlignmentVerticalValues.Center;
-            }
-
-            for (int r = 0; r < rows.Count; r++)
-            {
-                int excelRow = r + 2;
-                ws.Row(excelRow).Height = 20;
-                var rowData = rows[r];
-
-                for (int c = 0; c < headers.Length; c++)
-                {
-                    var cell = ws.Cell(excelRow, c + 1);
-                    string val = c < rowData.Length ? (rowData[c] ?? string.Empty) : string.Empty;
-                    if (textColSet.Contains(c + 1))
-                    {
-                        cell.Style.NumberFormat.Format = "@";
-                    }
-                    cell.Value = val;
-                    if (r % 2 == 1) cell.Style.Fill.BackgroundColor = zebraBg;
-                    cell.Style.Font.FontName = textColSet.Contains(c + 1) ? "Consolas" : "Segoe UI";
-                    cell.Style.Font.FontSize = 9.5;
-                    cell.Style.Border.OutsideBorder = XLBorderStyleValues.Thin;
-                    cell.Style.Border.OutsideBorderColor = borderColor;
-                    cell.Style.Alignment.Vertical = XLAlignmentVerticalValues.Center;
-                }
-            }
-
-            int lastRow = Math.Max(1, rows.Count + 1);
-            ws.Range(1, 1, lastRow, headers.Length).SetAutoFilter();
-
-            for (int c = 1; c <= headers.Length; c++)
-            {
-                int maxLen = headers[c - 1].Length;
-                foreach (var rowData in rows)
-                {
-                    if (c - 1 < rowData.Length && rowData[c - 1] != null)
-                        maxLen = Math.Max(maxLen, rowData[c - 1].Length);
-                }
-                ws.Column(c).Width = Math.Min(Math.Max(maxLen + 4, 12), 72);
-            }
+                Name = sheetName,
+                Headers = headers.ToArray(),
+                Rows = rows
+            };
         }
 
         // ── Parsing Helpers ──────────────────────────────────────────────────
