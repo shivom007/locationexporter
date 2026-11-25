@@ -1686,7 +1686,7 @@ namespace RevitLocationExporter.Commands
                 return Result.Cancelled;
             }
 
-            // ── 4. Process selected locations per file ────────────────────────
+            // ── 4. Process selected locations per file (Automatic Hybrid Pipeline) ──
             var updater = new ProjectInfoUpdater();
 
             try
@@ -1698,6 +1698,8 @@ namespace RevitLocationExporter.Commands
                     if (locationsToProcess.Count == 0) continue;
 
                     string fileName = Path.GetFileName(filePath);
+                    string[] fileTitleParts = Path.GetFileNameWithoutExtension(filePath).Split('-');
+                    string nativeModelLocator = fileTitleParts.Length >= 4 ? fileTitleParts[3].Trim() : string.Empty;
                     var rvtPath = ModelPathUtils.ConvertUserVisiblePathToModelPath(filePath);
 
                     // Dynamically resolve Trade for this file (e.g. TI0, EL0, ME0, PL0, AR0, ST0)
@@ -1708,13 +1710,20 @@ namespace RevitLocationExporter.Commands
                     // Resolve synced Excel bundle from Trade Profile (auto-syncs if Excel changed) or one-off override
                     LocationParameterBundle? paramBundle =
                         TradeExcelSyncService.ResolveBundleForRun(trade, selDlg.OneOffExcelOverridePath, log);
+                    ExcelFormulaEngine.TableLookupFunc? tableLookup =
+                        paramBundle?.LookupTables is { Count: > 0 }
+                            ? ExcelFormulaEngine.CreateTableLookup(paramBundle.LookupTables)
+                            : null;
 
                     string effProjNum = !string.IsNullOrWhiteSpace(trade.ProjectNumber) ? trade.ProjectNumber : settings.ProjectNumber;
                     string effOrig = !string.IsNullOrWhiteSpace(trade.Originator) ? trade.Originator : settings.Originator;
 
+                    // Pre-resolve export folder & location data up front
+                    bool needsExportFolder = options.SaveCentralRvt || options.ExportNwc || options.ExportIfc || options.ExportPdf || options.ExportDwg;
+                    var locContexts = new List<(string Name, Dictionary<string, string>? ElemParams, Dictionary<string, string>? SheetParams, string ExportRoot, Dictionary<string, string> Tokens)>();
+
                     foreach (string locationName in locationsToProcess)
                     {
-                        // Resolve parameter sets for this location (Element params vs Sheet params)
                         Dictionary<string, string>? elementParams = null;
                         Dictionary<string, string>? sheetParams = null;
 
@@ -1729,18 +1738,181 @@ namespace RevitLocationExporter.Commands
                         }
 
                         string? customExportFolder = paramBundle?.GetExportLocation(locationName);
-                        var builtInTokens = BuildLocationTokens(locationName, trade, effProjNum, effOrig);
-
+                        string exportRoot = string.Empty;
                         try
                         {
-                            ProcessOneLocation(app, rvtPath, locationName, elementParams, sheetParams, paramBundle,
-                                               customExportFolder, worksetOptions, log, updater, trade, settings, options,
-                                               effProjNum, effOrig, builtInTokens);
-                            log.Info(locationName, "All requested steps completed.");
+                            if (!string.IsNullOrWhiteSpace(customExportFolder))
+                            {
+                                exportRoot = customExportFolder!.Trim();
+                                log.Info(locationName, $"Export folder loaded from spreadsheet: '{exportRoot}'");
+                            }
+                            else if (needsExportFolder && !settings.TryGetOutputFolder(locationName, trade, out exportRoot))
+                            {
+                                throw new InvalidOperationException($"No export folder mapping for location '{locationName}' under trade '{trade.TradeName}'.");
+                            }
+
+                            if (!string.IsNullOrEmpty(exportRoot))
+                                log.Info(locationName, $"Export destination folder: {exportRoot}");
                         }
                         catch (Exception ex)
                         {
                             log.Error(locationName, $"[{fileName}] {ex.Message}");
+                            continue;
+                        }
+
+                        var builtInTokens = BuildLocationTokens(locationName, trade, effProjNum, effOrig);
+                        locContexts.Add((locationName, elementParams, sheetParams, exportRoot, builtInTokens));
+                    }
+
+                    if (locContexts.Count == 0) continue;
+
+                    // Compute WorksetConfiguration ONCE per source file
+                    OpenOptions openOpts = BuildOpenOptions(rvtPath, worksetOptions, trade, log);
+
+                    if (locContexts.Count == 1)
+                    {
+                        // Single location: direct detached open once
+                        var ctx = locContexts[0];
+                        try
+                        {
+                            using Document doc = app.OpenDocumentFile(rvtPath, openOpts);
+                            try
+                            {
+                                RunLocationStepsOnOpenDoc(doc, rvtPath, nativeModelLocator, ctx.Name, ctx.ElemParams, ctx.SheetParams,
+                                    paramBundle, ctx.ExportRoot, log, updater, trade, settings, options,
+                                    effProjNum, effOrig, ctx.Tokens, tableLookup, alreadyPreCleaned: false);
+                                doc.Close(false);
+                                log.Info(ctx.Name, "All requested steps completed.");
+                            }
+                            catch
+                            {
+                                try { doc.Close(false); } catch { }
+                                throw;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            log.Error(ctx.Name, $"[{fileName}] {ex.Message}");
+                        }
+                    }
+                    else if (!options.SaveCentralRvt)
+                    {
+                        // Hybrid Fast Path (2+ locations, SaveCentralRvt OFF):
+                        // Open heavy model ONCE, commit one-time pre-clean baseline, then isolate each location via TransactionGroup.RollBack()
+                        log.Info(fileName, $"Hybrid In-Memory mode: opening once for {locContexts.Count} location(s) (zero re-opens).");
+                        try
+                        {
+                            using Document doc = app.OpenDocumentFile(rvtPath, openOpts);
+                            try
+                            {
+                                PreCleanDocument(doc, nativeModelLocator, log, trade, options);
+
+                                foreach (var ctx in locContexts)
+                                {
+                                    using var tg = new TransactionGroup(doc, $"Export Location – {ctx.Name}");
+                                    tg.Start();
+                                    try
+                                    {
+                                        RunLocationStepsOnOpenDoc(doc, rvtPath, nativeModelLocator, ctx.Name, ctx.ElemParams, ctx.SheetParams,
+                                            paramBundle, ctx.ExportRoot, log, updater, trade, settings, options,
+                                            effProjNum, effOrig, ctx.Tokens, tableLookup, alreadyPreCleaned: true);
+                                        log.Info(ctx.Name, "All requested steps completed.");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        log.Error(ctx.Name, $"[{fileName}] {ex.Message}");
+                                    }
+                                    finally
+                                    {
+                                        try { if (tg.HasStarted()) tg.RollBack(); } catch { }
+                                    }
+                                }
+
+                                doc.Close(false);
+                            }
+                            catch
+                            {
+                                try { doc.Close(false); } catch { }
+                                throw;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            log.Error(fileName, $"Failed in-memory batch open for '{fileName}': {ex.Message}");
+                        }
+                    }
+                    else
+                    {
+                        // Hybrid Staged Path (2+ locations, SaveCentralRvt ON):
+                        // Open heavy model ONCE -> pre-clean & compact to fast local SSD temp copy -> extract each location cleanly
+                        string tempStageDir = Path.Combine(Path.GetTempPath(), $"RevitLocStage_{Guid.NewGuid():N}");
+                        Directory.CreateDirectory(tempStageDir);
+                        string stagedPath = Path.Combine(tempStageDir, fileName);
+                        ModelPath stagedModelPath;
+                        OpenOptions stagedOpenOpts;
+
+                        log.Info(fileName, $"Hybrid Staged mode: pre-cleaning and compacting '{fileName}' once for {locContexts.Count} central RVT export(s).");
+                        try
+                        {
+                            using (Document srcDoc = app.OpenDocumentFile(rvtPath, openOpts))
+                            {
+                                try
+                                {
+                                    PreCleanDocument(srcDoc, nativeModelLocator, log, trade, options);
+
+                                    var stageSaveOpts = new SaveAsOptions
+                                    {
+                                        OverwriteExistingFile = true,
+                                        Compact = true
+                                    };
+                                    if (srcDoc.IsWorkshared)
+                                    {
+                                        stageSaveOpts.SetWorksharingOptions(new WorksharingSaveAsOptions { SaveAsCentral = true });
+                                    }
+                                    srcDoc.SaveAs(stagedPath, stageSaveOpts);
+                                    stagedModelPath = ModelPathUtils.ConvertUserVisiblePathToModelPath(stagedPath);
+                                    stagedOpenOpts = BuildOpenOptions(stagedModelPath, worksetOptions, trade, log, quiet: true);
+                                    srcDoc.Close(false);
+                                }
+                                catch
+                                {
+                                    try { srcDoc.Close(false); } catch { }
+                                    throw;
+                                }
+                            }
+
+                            foreach (var ctx in locContexts)
+                            {
+                                try
+                                {
+                                    using Document doc = app.OpenDocumentFile(stagedModelPath, stagedOpenOpts);
+                                    try
+                                    {
+                                        RunLocationStepsOnOpenDoc(doc, stagedModelPath, nativeModelLocator, ctx.Name, ctx.ElemParams, ctx.SheetParams,
+                                            paramBundle, ctx.ExportRoot, log, updater, trade, settings, options,
+                                            effProjNum, effOrig, ctx.Tokens, tableLookup, alreadyPreCleaned: true);
+                                        doc.Close(false);
+                                        log.Info(ctx.Name, "All requested steps completed.");
+                                    }
+                                    catch
+                                    {
+                                        try { doc.Close(false); } catch { }
+                                        throw;
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    log.Error(ctx.Name, $"[{fileName}] {ex.Message}");
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            log.Error(fileName, $"Failed staged extraction for '{fileName}': {ex.Message}");
+                        }
+                        finally
+                        {
+                            try { if (Directory.Exists(tempStageDir)) Directory.Delete(tempStageDir, true); } catch { }
                         }
                     }
                 }
@@ -1761,6 +1933,7 @@ namespace RevitLocationExporter.Commands
             string rvtName = trade.FormatFileName(trade.RvtFileNameTemplate, projectNumber, originator, locationName);
             string ifcName = trade.FormatFileName(trade.IfcFileNameTemplate, projectNumber, originator, locationName);
             string nwcName = trade.FormatFileName(trade.NwcFileNameTemplate, projectNumber, originator, locationName);
+            string today = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
 
             return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
@@ -1773,51 +1946,20 @@ namespace RevitLocationExporter.Commands
                 { "Originator",    originator },
                 { "RvtFileName",   rvtName },
                 { "IfcFileName",   ifcName },
-                { "NwcFileName",   nwcName }
+                { "NwcFileName",   nwcName },
+                { "Today",         today },
+                { "Date",          today },
+                { "UserName",      Environment.UserName }
             };
         }
 
-        // ════════════════════════════════════════════════════════════════════
-        //  LOCATION PIPELINE (OPTION-AWARE)
-        // ════════════════════════════════════════════════════════════════════
-
-        private static void ProcessOneLocation(
-            Autodesk.Revit.ApplicationServices.Application app,
+        private static OpenOptions BuildOpenOptions(
             ModelPath rvtPath,
-            string locationName,
-            Dictionary<string, string>? elementParams,
-            Dictionary<string, string>? sheetParams,
-            LocationParameterBundle? paramBundle,
-            string? customExportFolder,
             WorksetSelectionOptions worksetOptions,
-            ProcessLog log,
-            ProjectInfoUpdater updater,
             TradeProfile trade,
-            ProjectSettings settings,
-            ExportExecutionOptions options,
-            string effProjNum,
-            string effOrig,
-            Dictionary<string, string> builtInTokens)
+            ProcessLog log,
+            bool quiet = false)
         {
-            bool needsExportFolder = options.SaveCentralRvt || options.ExportNwc || options.ExportIfc || options.ExportPdf || options.ExportDwg;
-            string exportRoot = string.Empty;
-
-            if (!string.IsNullOrWhiteSpace(customExportFolder))
-            {
-                exportRoot = customExportFolder!.Trim();
-                log.Info(locationName, $"Export folder loaded from spreadsheet: '{exportRoot}'");
-            }
-            else if (needsExportFolder && !settings.TryGetOutputFolder(locationName, trade, out exportRoot))
-            {
-                throw new InvalidOperationException($"No export folder mapping for location '{locationName}' under trade '{trade.TradeName}'.");
-            }
-
-            if (!string.IsNullOrEmpty(exportRoot))
-            {
-                log.Info(locationName, $"Export destination folder: {exportRoot}");
-            }
-
-            // Open worksets: configure based on global workset settings applied to all models
             var opts = new OpenOptions
             {
                 DetachFromCentralOption = DetachFromCentralOption.DetachAndPreserveWorksets,
@@ -1834,7 +1976,7 @@ namespace RevitLocationExporter.Commands
                     if (worksetOptions.OpenAllWorksets)
                     {
                         wsConfig.Open(allWorksets.Select(w => w.Id).ToList());
-                        log.Info(trade.TradeCode, $"Opened all {allWorksets.Count} worksets.");
+                        if (!quiet) log.Info(trade.TradeCode, $"Opened all {allWorksets.Count} worksets.");
                     }
                     else
                     {
@@ -1846,9 +1988,9 @@ namespace RevitLocationExporter.Commands
                         if (idsToOpen.Count > 0)
                         {
                             wsConfig.Open(idsToOpen);
-                            log.Info(trade.TradeCode, $"Opened {idsToOpen.Count} of {allWorksets.Count} worksets (global config).");
+                            if (!quiet) log.Info(trade.TradeCode, $"Opened {idsToOpen.Count} of {allWorksets.Count} worksets (global config).");
                         }
-                        else
+                        else if (!quiet)
                         {
                             log.Warning(trade.TradeCode, "No worksets matched global workset configuration — opening model with all user worksets closed.");
                         }
@@ -1859,77 +2001,193 @@ namespace RevitLocationExporter.Commands
             }
             catch (Exception ex)
             {
-                log.Warning(trade.TradeCode, $"Could not configure worksets before opening: {ex.Message}");
+                if (!quiet) log.Warning(trade.TradeCode, $"Could not configure worksets before opening: {ex.Message}");
             }
 
-            using Document doc = app.OpenDocumentFile(rvtPath, opts);
+            return opts;
+        }
+
+        private static Transaction StartSilentTransaction(Document doc, string name)
+        {
+            var tx = new Transaction(doc, name);
+            var failOpts = tx.GetFailureHandlingOptions();
+            failOpts.SetFailuresPreprocessor(new SilentFailurePreprocessor());
+            tx.SetFailureHandlingOptions(failOpts);
+            tx.Start();
+            return tx;
+        }
+
+        private static void PreCleanDocument(
+            Document doc,
+            string nativeModelLocator,
+            ProcessLog log,
+            TradeProfile trade,
+            ExportExecutionOptions options)
+        {
+            bool willUpdateSheets = options.FillParameters && (options.ExportPdf || options.ExportDwg ||
+                trade.ParameterRules.Any(r => r.Enabled && (r.Target == ParameterRuleTarget.Sheet || r.Target == ParameterRuleTarget.Titleblock)) ||
+                trade.TextNoteRules.Any(r => r.Enabled));
+
+            if (willUpdateSheets && !string.IsNullOrEmpty(nativeModelLocator))
+            {
+                DeleteObsoleteSheets(doc, nativeModelLocator, "PreClean", log, trade);
+            }
+
+            if (options.PurgeUnused)
+            {
+                PurgeUnused(doc, "PreClean", log);
+            }
+        }
+
+        private static int DeleteObsoleteSheets(
+            Document doc,
+            string nativeModelLocator,
+            string logKey,
+            ProcessLog log,
+            TradeProfile trade)
+        {
+            string coverName = string.IsNullOrWhiteSpace(trade.SheetCoverName) ? "Sheet Cover" : trade.SheetCoverName;
+            var deletePatterns = (trade.SheetDeletePatterns ?? new List<string>())
+                .Where(p => !string.IsNullOrWhiteSpace(p))
+                .ToList();
+
+            var allSheets = new FilteredElementCollector(doc)
+                .OfClass(typeof(ViewSheet))
+                .Cast<ViewSheet>()
+                .Where(s => !s.IsPlaceholder)
+                .ToList();
+
+            var sheetsToDelete = new List<ViewSheet>();
+            foreach (var s in allSheets)
+            {
+                if (s.Name.IndexOf(coverName, StringComparison.OrdinalIgnoreCase) >= 0)
+                    continue;
+
+                if (deletePatterns.Any(pat =>
+                    s.SheetNumber.IndexOf(pat, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    s.Name.IndexOf(pat, StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    sheetsToDelete.Add(s);
+                    continue;
+                }
+
+                string[] parts = s.SheetNumber.Split('-');
+                if (parts.Length >= 4 && !parts[3].Equals(nativeModelLocator, StringComparison.OrdinalIgnoreCase))
+                {
+                    sheetsToDelete.Add(s);
+                }
+            }
+
+            if (sheetsToDelete.Count == 0) return 0;
+
+            using var tx = StartSilentTransaction(doc, "Delete Obsolete Sheets");
+            int deletedCount = 0;
             try
             {
-                SetPinnedStateForReferenceElements(doc, false);
-
-                // 1. Coordinates & Workset Renaming
-                if (options.AlignCoordinatesAndWorksets)
-                {
-                    ActivateProjectLocation(doc, locationName, log, trade);
-                    RenameWorksets(doc, locationName, log, trade);
-                }
-
-                // 2. Parameter Population
-                if (options.FillParameters)
-                {
-                    FillSheetCoverParameters(doc, locationName, log, trade, elementParams, sheetParams, builtInTokens);
-                    FillCpkParameters(doc, locationName, elementParams, log, trade, settings, builtInTokens);
-                    UpdateProjectInfo(doc, updater, settings.ProjectData, locationName, sheetParams, elementParams,
-                                      log, trade, effProjNum, effOrig, builtInTokens);
-                }
-
-                // Update template '_PL' sheets (Sheet Number, Work Package, Titleblock Checkboxes, Parameters & TextNote Rules)
-                List<ViewSheet> plSheets = new();
-                if (options.FillParameters && (options.ExportPdf || options.ExportDwg ||
-                    trade.ParameterRules.Any(r => r.Enabled && (r.Target == ParameterRuleTarget.Sheet || r.Target == ParameterRuleTarget.Titleblock)) ||
-                    trade.TextNoteRules.Any(r => r.Enabled)))
-                {
-                    plSheets = UpdatePlSheets(doc, locationName, sheetParams, elementParams, paramBundle, log, trade, builtInTokens);
-                }
-
-                if (options.FillParameters && options.EnforceModelStandards)
-                {
-                    EnforceModelStandards(doc, rvtPath, locationName, elementParams, sheetParams,
-                                          paramBundle, exportRoot, log, trade, effProjNum, effOrig, options);
-                }
-
-                // 3. Purge Unused
-                if (options.PurgeUnused)
-                {
-                    PurgeUnused(doc, locationName, log);
-                }
-
-                // 4. 3D Model Exports (NWC, IFC)
-                if (options.ExportNwc || options.ExportIfc)
-                {
-                    Run3DExports(doc, locationName, exportRoot, log, trade, effProjNum, effOrig, options);
-                }
-
-                // 5. 2D Sheet Exports (PDF, DWG)
-                if (options.ExportPdf || options.ExportDwg)
-                {
-                    RunSheetExports(doc, locationName, exportRoot, log, options, plSheets);
-                }
-
-                SetPinnedStateForReferenceElements(doc, true);
-
-                // 6. Save Central RVT Model
-                if (options.SaveCentralRvt)
-                {
-                    SaveAsCentral(doc, locationName, exportRoot, log, trade, effProjNum, effOrig);
-                }
-
-                doc.Close(false);
+                var deleted = doc.Delete(sheetsToDelete.Select(s => s.Id).ToList());
+                deletedCount = sheetsToDelete.Count;
             }
             catch
             {
-                try { doc.Close(false); } catch { }
-                throw;
+                foreach (var s in sheetsToDelete)
+                {
+                    try { doc.Delete(s.Id); deletedCount++; }
+                    catch (Exception ex)
+                    {
+                        log.Warning(logKey, $"Could not delete obsolete sheet '{s.SheetNumber}': {ex.Message}");
+                    }
+                }
+            }
+            tx.Commit();
+
+            if (deletedCount > 0)
+                log.Info(logKey, $"Deleted {deletedCount} obsolete sheet(s) not matching native locator '{nativeModelLocator}' or delete rules.");
+
+            return deletedCount;
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        //  LOCATION PIPELINE (OPTION-AWARE)
+        // ════════════════════════════════════════════════════════════════════
+
+        private static void RunLocationStepsOnOpenDoc(
+            Document doc,
+            ModelPath rvtPath,
+            string nativeModelLocator,
+            string locationName,
+            Dictionary<string, string>? elementParams,
+            Dictionary<string, string>? sheetParams,
+            LocationParameterBundle? paramBundle,
+            string exportRoot,
+            ProcessLog log,
+            ProjectInfoUpdater updater,
+            TradeProfile trade,
+            ProjectSettings settings,
+            ExportExecutionOptions options,
+            string effProjNum,
+            string effOrig,
+            Dictionary<string, string> builtInTokens,
+            ExcelFormulaEngine.TableLookupFunc? tableLookup,
+            bool alreadyPreCleaned)
+        {
+            SetPinnedStateForReferenceElements(doc, false);
+
+            // 1. Coordinates & Workset Renaming
+            if (options.AlignCoordinatesAndWorksets)
+            {
+                ActivateProjectLocation(doc, locationName, log, trade);
+                RenameWorksets(doc, locationName, log, trade);
+            }
+
+            // 2. Parameter Population
+            if (options.FillParameters)
+            {
+                FillSheetCoverParameters(doc, locationName, log, trade, elementParams, sheetParams, builtInTokens, tableLookup);
+                FillCpkParameters(doc, locationName, elementParams, log, trade, settings, builtInTokens, tableLookup);
+                UpdateProjectInfo(doc, updater, settings.ProjectData, locationName, sheetParams, elementParams,
+                                  log, trade, effProjNum, effOrig, builtInTokens, tableLookup);
+            }
+
+            // Update template '_PL' sheets (Sheet Number, Work Package, Titleblock Checkboxes, Parameters & TextNote Rules)
+            List<ViewSheet> plSheets = new();
+            if (options.FillParameters && (options.ExportPdf || options.ExportDwg ||
+                trade.ParameterRules.Any(r => r.Enabled && (r.Target == ParameterRuleTarget.Sheet || r.Target == ParameterRuleTarget.Titleblock)) ||
+                trade.TextNoteRules.Any(r => r.Enabled)))
+            {
+                plSheets = UpdatePlSheets(doc, locationName, sheetParams, elementParams, paramBundle, log, trade,
+                                          builtInTokens, tableLookup, nativeModelLocator, alreadyPreCleaned);
+            }
+
+            if (options.FillParameters && options.EnforceModelStandards)
+            {
+                EnforceModelStandards(doc, rvtPath, locationName, elementParams, sheetParams,
+                                      paramBundle, exportRoot, log, trade, effProjNum, effOrig, options);
+            }
+
+            // 3. Purge Unused (skip when already run during PreCleanDocument)
+            if (options.PurgeUnused && !alreadyPreCleaned)
+            {
+                PurgeUnused(doc, locationName, log);
+            }
+
+            // 4. 3D Model Exports (NWC, IFC)
+            if (options.ExportNwc || options.ExportIfc)
+            {
+                Run3DExports(doc, locationName, exportRoot, log, trade, effProjNum, effOrig, options);
+            }
+
+            // 5. 2D Sheet Exports (PDF, DWG)
+            if (options.ExportPdf || options.ExportDwg)
+            {
+                RunSheetExports(doc, locationName, exportRoot, log, options, plSheets);
+            }
+
+            SetPinnedStateForReferenceElements(doc, true);
+
+            // 6. Save Central RVT Model
+            if (options.SaveCentralRvt)
+            {
+                SaveAsCentral(doc, locationName, exportRoot, log, trade, effProjNum, effOrig);
             }
         }
 
@@ -2043,7 +2301,8 @@ namespace RevitLocationExporter.Commands
             TradeProfile trade,
             Dictionary<string, string>? elementParams,
             Dictionary<string, string>? sheetParams,
-            Dictionary<string, string> builtInTokens)
+            Dictionary<string, string> builtInTokens,
+            ExcelFormulaEngine.TableLookupFunc? tableLookup)
         {
             string coverName = string.IsNullOrWhiteSpace(trade.SheetCoverName) ? "Sheet Cover" : trade.SheetCoverName;
             var sheets = new FilteredElementCollector(doc)
@@ -2059,32 +2318,33 @@ namespace RevitLocationExporter.Commands
             }
 
             IList<ElementId> allRevisionIds = Revision.GetAllRevisionIds(doc);
-            if (allRevisionIds.Count > 0 && sheets.Count > 0)
-            {
-                using var txRev = new Transaction(doc, "Add All Revisions to Sheets");
-                txRev.Start();
-                foreach (ViewSheet sheet in sheets)
-                {
-                    ICollection<ElementId> current = sheet.GetAdditionalRevisionIds();
-                    foreach (ElementId revId in allRevisionIds)
-                        if (!current.Contains(revId))
-                            current.Add(revId);
-                    sheet.SetAdditionalRevisionIds(current);
-                }
-                txRev.Commit();
-            }
-
-            using var tx = new Transaction(doc, "Fill Sheet Cover Coordinates");
-            tx.Start();
-
             var pbp = GetBasePoint(doc, BuiltInCategory.OST_ProjectBasePoint);
             var svp = GetBasePoint(doc, BuiltInCategory.OST_SharedBasePoint);
 
             if (pbp == null || svp == null)
             {
                 log.Warning(locationName, "Base Point or Survey Point not found — sheet cover params skipped.");
-                tx.RollBack();
                 return;
+            }
+
+            using var tx = StartSilentTransaction(doc, "Fill Sheet Cover Revisions & Coordinates");
+
+            if (allRevisionIds.Count > 0)
+            {
+                foreach (ViewSheet sheet in sheets)
+                {
+                    ICollection<ElementId> current = sheet.GetAdditionalRevisionIds();
+                    bool added = false;
+                    foreach (ElementId revId in allRevisionIds)
+                    {
+                        if (!current.Contains(revId))
+                        {
+                            current.Add(revId);
+                            added = true;
+                        }
+                    }
+                    if (added) sheet.SetAdditionalRevisionIds(current);
+                }
             }
 
             double pbpN = ToMm(pbp, BuiltInParameter.BASEPOINT_NORTHSOUTH_PARAM);
@@ -2122,11 +2382,14 @@ namespace RevitLocationExporter.Commands
                             { "DAR_SVP_E", svpE.ToString(CultureInfo.InvariantCulture) },
                             { "DAR_SVP_Z", svpZ.ToString(CultureInfo.InvariantCulture) },
                             { "Sheet Number", sheet.SheetNumber },
-                            { "Sheet Name", sheet.Name }
+                            { "SheetNumber", sheet.SheetNumber },
+                            { "Sheet Name", sheet.Name },
+                            { "SheetName", sheet.Name }
                         };
                         var resolved = ExcelFormulaEngine.ResolveRulesInOrder(
                             matchingRules,
                             key => LookupCombinedValue(key, extra, sheetParams, elementParams, sheet, null, builtInTokens),
+                            tableLookup,
                             out var warnings);
                         foreach (var w in warnings) log.Warning(locationName, w);
                         foreach (var kv in resolved)
@@ -2155,7 +2418,8 @@ namespace RevitLocationExporter.Commands
             TradeProfile trade,
             string effProjNum,
             string effOrig,
-            Dictionary<string, string> builtInTokens)
+            Dictionary<string, string> builtInTokens,
+            ExcelFormulaEngine.TableLookupFunc? tableLookup = null)
         {
             var mergedProjectData = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (projectData != null)
@@ -2211,13 +2475,13 @@ namespace RevitLocationExporter.Commands
                 var resolved = ExcelFormulaEngine.ResolveRulesInOrder(
                     piRules,
                     key => LookupCombinedValue(key, mergedProjectData, dynDict, sheetParams, doc.ProjectInformation, null, builtInTokens, elementParams),
+                    tableLookup,
                     out var warnings);
                 foreach (var w in warnings) log.Warning(locationName, w);
 
                 if (resolved.Count > 0)
                 {
-                    using var tx = new Transaction(doc, "Apply Trade ProjectInfo Rules");
-                    tx.Start();
+                    using var tx = StartSilentTransaction(doc, "Apply Trade ProjectInfo Rules");
                     foreach (var kv in resolved)
                     {
                         TryApplyRuleParam(doc.ProjectInformation, kv.Key, kv.Value.Value, kv.Value.Rule.Mode);
@@ -2227,6 +2491,63 @@ namespace RevitLocationExporter.Commands
             }
         }
 
+        private static bool IsElementRuleTarget(ParameterRuleTarget t) =>
+            t == ParameterRuleTarget.Element ||
+            t == ParameterRuleTarget.ElementInstance ||
+            t == ParameterRuleTarget.ElementType ||
+            t == ParameterRuleTarget.ElementBoth;
+
+        private static readonly HashSet<string> InstanceVaryingMetaTokens = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Level", "Workset", "PhaseCreated", "Phase", "ElementId", "RoomName", "RoomNumber", "SpaceName"
+        };
+
+        private static bool HasInstanceVaryingTokens(
+            ExcelFormulaEngine.CompiledRuleSet compiled,
+            IList<ParameterRule> rules,
+            Dictionary<string, string>? csvParamSet,
+            Dictionary<string, string> builtInTokens,
+            Element representative)
+        {
+            if (compiled.AllReferencedTokens.Count == 0) return false;
+
+            var ruleOutputNames = new HashSet<string>(
+                rules.Where(r => r.Enabled && !string.IsNullOrWhiteSpace(r.ParameterName))
+                     .Select(r => r.ParameterName.Trim()),
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (string tok in compiled.AllReferencedTokens)
+            {
+                if (InstanceVaryingMetaTokens.Contains(tok))
+                    return true;
+
+                // Self-referencing instance rule or existing instance parameter override must read per instance
+                if ((csvParamSet == null || !csvParamSet.ContainsKey(tok)) &&
+                    !builtInTokens.ContainsKey(tok) &&
+                    !ruleOutputNames.Contains(tok) &&
+                    representative.LookupParameter(tok) != null)
+                {
+                    return true;
+                }
+
+                // Rule references its own prior instance value
+                if (ruleOutputNames.Contains(tok) && representative.LookupParameter(tok) != null)
+                {
+                    foreach (var r in rules)
+                    {
+                        if (r.Enabled && string.Equals(r.ParameterName.Trim(), tok, StringComparison.OrdinalIgnoreCase))
+                        {
+                            var rRefs = ExcelFormulaEngine.ExtractReferences(r.ValueOrFormula);
+                            if (rRefs.Any(rr => string.Equals(rr, tok, StringComparison.OrdinalIgnoreCase)))
+                                return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+
         private static void FillCpkParameters(
             Document doc,
             string locationName,
@@ -2234,7 +2555,8 @@ namespace RevitLocationExporter.Commands
             ProcessLog log,
             TradeProfile trade,
             ProjectSettings settings,
-            Dictionary<string, string> builtInTokens)
+            Dictionary<string, string> builtInTokens,
+            ExcelFormulaEngine.TableLookupFunc? tableLookup)
         {
             var categoryFilter = trade.GetCategoryFilter();
             if (categoryFilter == null)
@@ -2244,11 +2566,10 @@ namespace RevitLocationExporter.Commands
             }
 
             var elementRules = trade.ParameterRules
-                .Where(r => r.Enabled && r.Target == ParameterRuleTarget.Element)
+                .Where(r => r.Enabled && IsElementRuleTarget(r.Target))
                 .ToList();
 
-            using var tx = new Transaction(doc, "Fill CPK Parameters");
-            tx.Start();
+            using var tx = StartSilentTransaction(doc, "Fill CPK Parameters");
 
             var groups = new Dictionary<ElementId, (ElementType Type, List<Element> Instances)>();
             var orphans = new List<Element>();
@@ -2286,14 +2607,15 @@ namespace RevitLocationExporter.Commands
                     Element representative = instances[0];
                     foreach (var kvp in csvParamSet)
                     {
-                        var instParam = representative.LookupParameter(kvp.Key);
-                        if (instParam != null && !instParam.IsReadOnly)
+                        var instAccessor = FastParamAccessor.Resolve(representative, kvp.Key);
+                        var repParam = instAccessor.Get(representative);
+                        if (repParam != null && !repParam.IsReadOnly)
                         {
                             foreach (Element inst in instances)
                             {
-                                var p = inst.LookupParameter(kvp.Key);
+                                var p = instAccessor.Get(inst);
                                 if (p == null || p.IsReadOnly) continue;
-                                try { SetParamValue(p, kvp.Value); instWrites++; }
+                                try { if (SetParamValueIfChanged(p, kvp.Value)) instWrites++; }
                                 catch { failures++; }
                             }
                             continue;
@@ -2302,7 +2624,7 @@ namespace RevitLocationExporter.Commands
                         var typeParam = type.LookupParameter(kvp.Key);
                         if (typeParam != null && !typeParam.IsReadOnly)
                         {
-                            try { SetParamValue(typeParam, kvp.Value); typeWrites++; }
+                            try { if (SetParamValueIfChanged(typeParam, kvp.Value)) typeWrites++; }
                             catch { failures++; }
                         }
                     }
@@ -2314,13 +2636,13 @@ namespace RevitLocationExporter.Commands
                     {
                         var p = orphan.LookupParameter(kvp.Key);
                         if (p == null || p.IsReadOnly) continue;
-                        try { SetParamValue(p, kvp.Value); instWrites++; }
+                        try { if (SetParamValueIfChanged(p, kvp.Value)) instWrites++; }
                         catch { failures++; }
                     }
                 }
 
                 log.Info(locationName,
-                    $"CPK params (CSV, {csvParamSet.Count} column(s)): {instWrites} instance value(s), {typeWrites} type value(s) written.");
+                    $"CPK params (CSV, {csvParamSet.Count} column(s)): {instWrites} instance value(s), {typeWrites} type value(s) updated.");
             }
             else if (elementRules.Count == 0)
             {
@@ -2341,7 +2663,7 @@ namespace RevitLocationExporter.Commands
                 log.Info(locationName, $"CPK params (config fallback) updated on {updated} {trade.TradeName} element type(s).");
             }
 
-            // Apply Trade Profile Parameter & Formula Rules (Element scope)
+            // Apply Trade Profile Parameter & Formula Rules (Element scopes with AST compile + constant hoisting + GUID cache)
             if (elementRules.Count > 0)
             {
                 int ruleInstWrites = 0, ruleTypeWrites = 0;
@@ -2356,59 +2678,106 @@ namespace RevitLocationExporter.Commands
 
                     if (matchingRules.Count == 0) continue;
 
-                    // Precompute type-level values once using representative + type
-                    var typeResolved = ExcelFormulaEngine.ResolveRulesInOrder(
-                        matchingRules,
+                    var compiled = ExcelFormulaEngine.CompileRules(matchingRules);
+                    var repResolved = compiled.EvaluateMap(
                         key => LookupCombinedValue(key, csvParamSet, null, null, representative, type, builtInTokens),
-                        out var typeWarnings);
-                    foreach (var w in typeWarnings)
+                        out var repWarnings,
+                        tableLookup);
+                    foreach (var w in repWarnings)
                     {
                         if (loggedWarnings.Add(w)) log.Warning(locationName, w);
                     }
 
-                    // Determine which rules write to type vs instance on this group
-                    var typeOnlyRules = new List<string>();
-                    foreach (var kv in typeResolved)
-                    {
-                        var instParam = representative.LookupParameter(kv.Key);
-                        if (instParam != null && !instParam.IsReadOnly) continue;
+                    var instRuleTargets = new List<(string ParamName, FastParamAccessor Accessor)>();
+                    var instRulesSubset = new List<ParameterRule>();
 
-                        var typeParam = type.LookupParameter(kv.Key);
-                        if (typeParam != null && !typeParam.IsReadOnly)
+                    foreach (var r in matchingRules)
+                    {
+                        string pName = r.ParameterName.Trim();
+                        if (string.IsNullOrEmpty(pName)) continue;
+
+                        bool hasRepValue = repResolved.TryGetValue(pName, out var rv);
+                        bool targetType = r.Target == ParameterRuleTarget.ElementType || r.Target == ParameterRuleTarget.ElementBoth;
+                        bool targetInst = r.Target == ParameterRuleTarget.ElementInstance || r.Target == ParameterRuleTarget.ElementBoth;
+
+                        if (r.Target == ParameterRuleTarget.Element)
+                        {
+                            var repP = representative.LookupParameter(pName);
+                            if (repP != null && !repP.IsReadOnly)
+                                targetInst = true;
+                            else
+                                targetType = true;
+                        }
+
+                        if (targetType && hasRepValue)
                         {
                             try
                             {
-                                if (TryApplyRuleParam(type, kv.Key, kv.Value.Value, kv.Value.Rule.Mode))
+                                if (TryApplyRuleParam(type, pName, rv.Value, rv.Rule.Mode))
                                     ruleTypeWrites++;
                             }
                             catch { failures++; }
-                            typeOnlyRules.Add(kv.Key);
+                        }
+
+                        if (targetInst)
+                        {
+                            var acc = FastParamAccessor.Resolve(representative, pName);
+                            var pSample = acc.Get(representative);
+                            if (pSample != null && !pSample.IsReadOnly)
+                            {
+                                instRulesSubset.Add(r);
+                                if (!instRuleTargets.Any(x => x.ParamName.Equals(pName, StringComparison.OrdinalIgnoreCase)))
+                                    instRuleTargets.Add((pName, acc));
+                            }
                         }
                     }
 
-                    var typeOnlySet = new HashSet<string>(typeOnlyRules, StringComparer.OrdinalIgnoreCase);
-                    var instRules = matchingRules.Where(r => !typeOnlySet.Contains(r.ParameterName.Trim())).ToList();
-                    if (instRules.Count == 0) continue;
+                    if (instRulesSubset.Count == 0) continue;
 
-                    foreach (Element inst in instances)
+                    bool hoistable = !HasInstanceVaryingTokens(compiled, matchingRules, csvParamSet, builtInTokens, representative) &&
+                                     !matchingRules.Any(r => r.HasCondition);
+
+                    if (hoistable)
                     {
-                        var instResolved = ExcelFormulaEngine.ResolveRulesInOrder(
-                            instRules,
-                            key => LookupCombinedValue(key, csvParamSet, null, null, inst, type, builtInTokens),
-                            out var instWarnings);
-                        foreach (var w in instWarnings)
+                        foreach (Element inst in instances)
                         {
-                            if (loggedWarnings.Add(w)) log.Warning(locationName, w);
-                        }
-
-                        foreach (var kv in instResolved)
-                        {
-                            try
+                            foreach (var (pName, acc) in instRuleTargets)
                             {
-                                if (TryApplyRuleParam(inst, kv.Key, kv.Value.Value, kv.Value.Rule.Mode))
-                                    ruleInstWrites++;
+                                if (!repResolved.TryGetValue(pName, out var rv)) continue;
+                                try
+                                {
+                                    var p = acc.Get(inst);
+                                    if (TryApplyRuleParam(inst, pName, rv.Value, rv.Rule.Mode, p))
+                                        ruleInstWrites++;
+                                }
+                                catch { failures++; }
                             }
-                            catch { failures++; }
+                        }
+                    }
+                    else
+                    {
+                        foreach (Element inst in instances)
+                        {
+                            var instResolved = compiled.EvaluateMap(
+                                key => LookupCombinedValue(key, csvParamSet, null, null, inst, type, builtInTokens),
+                                out var instWarnings,
+                                tableLookup);
+                            foreach (var w in instWarnings)
+                            {
+                                if (loggedWarnings.Add(w)) log.Warning(locationName, w);
+                            }
+
+                            foreach (var (pName, acc) in instRuleTargets)
+                            {
+                                if (!instResolved.TryGetValue(pName, out var rv)) continue;
+                                try
+                                {
+                                    var p = acc.Get(inst);
+                                    if (TryApplyRuleParam(inst, pName, rv.Value, rv.Rule.Mode, p))
+                                        ruleInstWrites++;
+                                }
+                                catch { failures++; }
+                            }
                         }
                     }
                 }
@@ -2416,13 +2785,15 @@ namespace RevitLocationExporter.Commands
                 foreach (Element orphan in orphans)
                 {
                     var matchingRules = elementRules
-                        .Where(r => MatchesElementRuleFilter(doc, orphan, null, r.Filter))
+                        .Where(r => r.Target != ParameterRuleTarget.ElementType &&
+                                    MatchesElementRuleFilter(doc, orphan, null, r.Filter))
                         .ToList();
                     if (matchingRules.Count == 0) continue;
 
                     var orphanResolved = ExcelFormulaEngine.ResolveRulesInOrder(
                         matchingRules,
                         key => LookupCombinedValue(key, csvParamSet, null, null, orphan, null, builtInTokens),
+                        tableLookup,
                         out var orphanWarnings);
                     foreach (var w in orphanWarnings)
                     {
@@ -2441,7 +2812,7 @@ namespace RevitLocationExporter.Commands
                 }
 
                 log.Info(locationName,
-                    $"Trade parameter rules ({elementRules.Count} active): {ruleInstWrites} instance value(s), {ruleTypeWrites} type value(s) written.");
+                    $"Trade parameter rules ({elementRules.Count} active): {ruleInstWrites} instance value(s), {ruleTypeWrites} type value(s) updated.");
             }
 
             if (failures > 0)
@@ -2456,20 +2827,28 @@ namespace RevitLocationExporter.Commands
 
         private static void PurgeUnused(Document doc, string locationName, ProcessLog log)
         {
+            const int MaxPurgePasses = 5;
             int totalPurged = 0;
             try
             {
-                using Transaction t = new Transaction(doc, "Purge Unused");
-                t.Start();
+                using var t = StartSilentTransaction(doc, "Purge Unused");
 
                 ISet<ElementId> unusedIds = doc.GetUnusedElements(new HashSet<ElementId>());
+                HashSet<ElementId>? previousUnused = null;
                 int iterations = 0;
 
-                while (unusedIds.Any())
+                while (unusedIds.Count > 0 && iterations < MaxPurgePasses)
                 {
-                    doc.Delete(unusedIds);
+                    if (previousUnused != null && previousUnused.SetEquals(unusedIds))
+                        break;
+
+                    var deleted = doc.Delete(unusedIds);
+                    if (deleted.Count == 0)
+                        break;
+
                     totalPurged += unusedIds.Count;
                     iterations++;
+                    previousUnused = new HashSet<ElementId>(unusedIds);
                     unusedIds = doc.GetUnusedElements(new HashSet<ElementId>());
                 }
 
@@ -2588,21 +2967,27 @@ namespace RevitLocationExporter.Commands
             LocationParameterBundle? paramBundle,
             ProcessLog log,
             TradeProfile trade,
-            Dictionary<string, string> builtInTokens)
+            Dictionary<string, string> builtInTokens,
+            ExcelFormulaEngine.TableLookupFunc? tableLookup,
+            string? nativeModelLocatorOverride = null,
+            bool alreadyPreCleaned = false)
         {
-            var titleParts = doc.Title.Split('-');
-            if (titleParts.Length < 4)
+            string nativeModelLocator = !string.IsNullOrWhiteSpace(nativeModelLocatorOverride)
+                ? nativeModelLocatorOverride!.Trim()
+                : string.Empty;
+
+            if (string.IsNullOrEmpty(nativeModelLocator))
             {
-                log.Warning(locationName, $"Document title '{doc.Title}' does not follow hyphenated convention (expected >= 4 segments). Sheet processing skipped.");
-                return new List<ViewSheet>();
+                var titleParts = doc.Title.Split('-');
+                if (titleParts.Length < 4)
+                {
+                    log.Warning(locationName, $"Document title '{doc.Title}' does not follow hyphenated convention (expected >= 4 segments). Sheet processing skipped.");
+                    return new List<ViewSheet>();
+                }
+                nativeModelLocator = titleParts[3].Trim();
             }
 
-            var nativeModelLocator = titleParts[3].Trim();
-            string coverName = string.IsNullOrWhiteSpace(trade.SheetCoverName) ? "Sheet Cover" : trade.SheetCoverName;
             string includeToken = trade.SheetIncludeToken ?? string.Empty;
-            var deletePatterns = (trade.SheetDeletePatterns ?? new List<string>())
-                .Where(p => !string.IsNullOrWhiteSpace(p))
-                .ToList();
 
             var sheetRules = trade.ParameterRules
                 .Where(r => r.Enabled && r.Target == ParameterRuleTarget.Sheet)
@@ -2611,55 +2996,10 @@ namespace RevitLocationExporter.Commands
                 .Where(r => r.Enabled && r.Target == ParameterRuleTarget.Titleblock)
                 .ToList();
 
-            using var tx = new Transaction(doc, $"Update PL Sheets for {locationName}");
-            tx.Start();
-
-            // ── 1. Delete sheets that are NOT nativeModelLocator BEFORE modifying anything ──
-            var allSheets = new FilteredElementCollector(doc)
-                .OfClass(typeof(ViewSheet))
-                .Cast<ViewSheet>()
-                .Where(s => !s.IsPlaceholder)
-                .ToList();
-
-            var sheetsToDelete = new List<ViewSheet>();
-            foreach (var s in allSheets)
+            // ── 1. Delete obsolete sheets (skipped if PreCleanDocument already ran) ──
+            if (!alreadyPreCleaned)
             {
-                // Preserve Sheet Cover
-                if (s.Name.IndexOf(coverName, StringComparison.OrdinalIgnoreCase) >= 0)
-                    continue;
-
-                // Delete sheets matching configured delete patterns (e.g. "210001_EN")
-                if (deletePatterns.Any(pat =>
-                    s.SheetNumber.IndexOf(pat, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    s.Name.IndexOf(pat, StringComparison.OrdinalIgnoreCase) >= 0))
-                {
-                    sheetsToDelete.Add(s);
-                    continue;
-                }
-
-                string[] parts = s.SheetNumber.Split('-');
-                if (parts.Length >= 4 && !parts[3].Equals(nativeModelLocator, StringComparison.OrdinalIgnoreCase))
-                {
-                    sheetsToDelete.Add(s);
-                }
-            }
-
-            if (sheetsToDelete.Count > 0)
-            {
-                int deletedCount = 0;
-                foreach (var s in sheetsToDelete)
-                {
-                    try
-                    {
-                        doc.Delete(s.Id);
-                        deletedCount++;
-                    }
-                    catch (Exception ex)
-                    {
-                        log.Warning(locationName, $"Could not delete obsolete sheet '{s.SheetNumber}': {ex.Message}");
-                    }
-                }
-                log.Info(locationName, $"Deleted {deletedCount} sheet(s) not matching native locator '{nativeModelLocator}' or matching delete rules.");
+                DeleteObsoleteSheets(doc, nativeModelLocator, locationName, log, trade);
             }
 
             // ── 2. Collect template sheets matching nativeModelLocator ──
@@ -2677,9 +3017,18 @@ namespace RevitLocationExporter.Commands
             if (plSheets.Count == 0)
             {
                 log.Warning(locationName, $"No template sheets matching native locator '{nativeModelLocator}' were found in the model.");
-                tx.Commit();
                 return plSheets;
             }
+
+            // Pre-group ALL titleblocks in document once instead of running a FilteredElementCollector per sheet
+            var titleBlocksBySheet = new FilteredElementCollector(doc)
+                .OfCategory(BuiltInCategory.OST_TitleBlocks)
+                .WhereElementIsNotElementType()
+                .Where(tb => tb.OwnerViewId != ElementId.InvalidElementId)
+                .GroupBy(tb => tb.OwnerViewId)
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            using var tx = StartSilentTransaction(doc, $"Update PL Sheets for {locationName}");
 
             int renamedCount = 0;
             int tbUpdatedCount = 0;
@@ -2729,18 +3078,38 @@ namespace RevitLocationExporter.Commands
 
                     var appliedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-                    // 4. Titleblock instances on this sheet
-                    var titleBlocks = new FilteredElementCollector(doc, sheet.Id)
-                        .OfCategory(BuiltInCategory.OST_TitleBlocks)
-                        .WhereElementIsNotElementType()
-                        .ToList();
+                    // 4. Titleblock instances pre-grouped for this sheet
+                    if (!titleBlocksBySheet.TryGetValue(sheet.Id, out var titleBlocks))
+                        titleBlocks = new List<Element>();
+
+                    string[] sheetSegs = sheet.SheetNumber.Split('-');
+                    string sysCode = sheetSegs.Length >= 3 ? sheetSegs[2].Trim() : string.Empty;
+                    string lvlCode = sheetSegs.Length >= 5 ? sheetSegs[4].Trim() : string.Empty;
+                    string drwSeq = sheetSegs.Length >= 7 ? sheetSegs[6].Trim() : string.Empty;
+
+                    string currRev = string.Empty;
+                    string currRevDate = string.Empty;
+                    ElementId currRevId = sheet.GetCurrentRevision();
+                    if (currRevId != ElementId.InvalidElementId && doc.GetElement(currRevId) is Revision revObj)
+                    {
+                        currRev = revObj.RevisionNumber ?? string.Empty;
+                        currRevDate = revObj.RevisionDate ?? string.Empty;
+                    }
 
                     var sheetMetaTokens = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                     {
-                        { "Sheet Number", sheet.SheetNumber },
-                        { "SheetNumber", sheet.SheetNumber },
-                        { "Sheet Name", sheet.Name },
-                        { "SheetName", sheet.Name }
+                        { "Sheet Number",        sheet.SheetNumber },
+                        { "SheetNumber",         sheet.SheetNumber },
+                        { "Sheet Name",          sheet.Name },
+                        { "SheetName",           sheet.Name },
+                        { "WorkPackage",         sheetWp },
+                        { "Work_Package",        sheetWp },
+                        { "DisciplineCode",      sysCode },
+                        { "SystemCode",          sysCode },
+                        { "LevelCode",           lvlCode },
+                        { "DrawingSeq",          drwSeq },
+                        { "CurrentRevision",     currRev },
+                        { "CurrentRevisionDate", currRevDate }
                     };
 
                     foreach (var tb in titleBlocks)
@@ -2779,6 +3148,7 @@ namespace RevitLocationExporter.Commands
                                 var resolvedTb = ExcelFormulaEngine.ResolveRulesInOrder(
                                     matchingTb,
                                     key => LookupCombinedValue(key, sheetMetaTokens, effective, elementParams, tb, tbType, builtInTokens, null, sheet),
+                                    tableLookup,
                                     out var tbWarnings);
                                 foreach (var w in tbWarnings) log.Warning(locationName, w);
                                 foreach (var kv in resolvedTb)
@@ -2811,6 +3181,7 @@ namespace RevitLocationExporter.Commands
                             var resolvedSheet = ExcelFormulaEngine.ResolveRulesInOrder(
                                 matchingSheetRules,
                                 key => LookupCombinedValue(key, sheetMetaTokens, effective, elementParams, sheet, null, builtInTokens),
+                                tableLookup,
                                 out var sWarnings);
                             foreach (var w in sWarnings) log.Warning(locationName, w);
                             foreach (var kv in resolvedSheet)
@@ -3538,6 +3909,43 @@ namespace RevitLocationExporter.Commands
             return merged;
         }
 
+        private readonly struct FastParamAccessor
+        {
+            public readonly Guid? SharedGuid;
+            public readonly BuiltInParameter BuiltIn;
+            public readonly string Name;
+
+            private FastParamAccessor(Guid? sharedGuid, BuiltInParameter builtIn, string name)
+            {
+                SharedGuid = sharedGuid;
+                BuiltIn = builtIn;
+                Name = name;
+            }
+
+            public static FastParamAccessor Resolve(Element sampleElem, string paramName)
+            {
+                var p = sampleElem.LookupParameter(paramName);
+                if (p != null)
+                {
+                    if (p.IsShared)
+                    {
+                        try { return new FastParamAccessor(p.GUID, BuiltInParameter.INVALID, paramName); }
+                        catch { }
+                    }
+                    if (p.Definition is InternalDefinition id && id.BuiltInParameter != BuiltInParameter.INVALID)
+                        return new FastParamAccessor(null, id.BuiltInParameter, paramName);
+                }
+                return new FastParamAccessor(null, BuiltInParameter.INVALID, paramName);
+            }
+
+            public Parameter? Get(Element e)
+            {
+                if (SharedGuid.HasValue) return e.get_Parameter(SharedGuid.Value);
+                if (BuiltIn != BuiltInParameter.INVALID) return e.get_Parameter(BuiltIn);
+                return e.LookupParameter(Name);
+            }
+        }
+
         /// <summary>Writes a value if the parameter exists and is editable. "&lt;CLEAR&gt;" writes an empty value.</summary>
         private static bool TryApplyParam(Element e, string name, string raw)
         {
@@ -3545,21 +3953,71 @@ namespace RevitLocationExporter.Commands
             if (p == null || p.IsReadOnly) return false;
 
             string value = raw.Equals("<CLEAR>", StringComparison.OrdinalIgnoreCase) ? string.Empty : raw;
-            SetParamValue(p, value);
+            SetParamValueIfChanged(p, value);
             return true;
         }
 
-        private static bool TryApplyRuleParam(Element e, string name, string raw, ParameterFillMode mode)
+        private static bool TryApplyRuleParam(
+            Element e,
+            string name,
+            string raw,
+            ParameterFillMode mode,
+            Parameter? preResolvedParam = null)
         {
-            var p = e.LookupParameter(name);
+            var p = preResolvedParam ?? e.LookupParameter(name);
             if (p == null || p.IsReadOnly) return false;
 
-            if (mode == ParameterFillMode.FillIfEmpty && !IsParameterEmpty(p))
-                return false;
+            string finalVal;
+            switch (mode)
+            {
+                case ParameterFillMode.Clear:
+                    finalVal = string.Empty;
+                    break;
 
-            string value = raw.Equals("<CLEAR>", StringComparison.OrdinalIgnoreCase) ? string.Empty : raw;
-            SetParamValue(p, value);
-            return true;
+                case ParameterFillMode.FillIfEmpty:
+                    if (!IsParameterEmpty(p)) return false;
+                    finalVal = raw.Equals("<CLEAR>", StringComparison.OrdinalIgnoreCase) ? string.Empty : raw;
+                    break;
+
+                case ParameterFillMode.SkipIfBlankResult:
+                    if (string.IsNullOrWhiteSpace(raw)) return false;
+                    finalVal = raw.Equals("<CLEAR>", StringComparison.OrdinalIgnoreCase) ? string.Empty : raw;
+                    break;
+
+                case ParameterFillMode.Append:
+                {
+                    if (string.IsNullOrEmpty(raw)) return false;
+                    string existing = ReadParameterRawString(p);
+                    finalVal = string.IsNullOrEmpty(existing) ? raw : existing + raw;
+                    break;
+                }
+
+                case ParameterFillMode.Prepend:
+                {
+                    if (string.IsNullOrEmpty(raw)) return false;
+                    string existing = ReadParameterRawString(p);
+                    finalVal = string.IsNullOrEmpty(existing) ? raw : raw + existing;
+                    break;
+                }
+
+                default: // Overwrite
+                    finalVal = raw.Equals("<CLEAR>", StringComparison.OrdinalIgnoreCase) ? string.Empty : raw;
+                    break;
+            }
+
+            return SetParamValueIfChanged(p, finalVal);
+        }
+
+        private static string ReadParameterRawString(Parameter p)
+        {
+            if (!p.HasValue) return string.Empty;
+            return p.StorageType switch
+            {
+                StorageType.String => p.AsString() ?? string.Empty,
+                StorageType.Integer => p.AsInteger().ToString(CultureInfo.InvariantCulture),
+                StorageType.Double => p.AsValueString() ?? p.AsDouble().ToString(CultureInfo.InvariantCulture),
+                _ => string.Empty
+            };
         }
 
         private static bool IsParameterEmpty(Parameter p)
@@ -3670,6 +4128,52 @@ namespace RevitLocationExporter.Commands
                 return type?.Name ?? elem.Name;
             if (paramName.Equals("Family and Type", StringComparison.OrdinalIgnoreCase))
                 return type != null ? $"{type.FamilyName}: {type.Name}" : elem.Name;
+            if (paramName.Equals("ElementId", StringComparison.OrdinalIgnoreCase))
+                return elem.Id.Value.ToString(CultureInfo.InvariantCulture);
+            if (paramName.Equals("ModelTitle", StringComparison.OrdinalIgnoreCase))
+                return elem.Document.Title;
+            if (paramName.Equals("Workset", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    if (elem.WorksetId != WorksetId.InvalidWorksetId)
+                        return elem.Document.GetWorksetTable().GetWorkset(elem.WorksetId)?.Name;
+                }
+                catch { }
+                return null;
+            }
+            if (paramName.Equals("PhaseCreated", StringComparison.OrdinalIgnoreCase) ||
+                paramName.Equals("Phase", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    if (elem.CreatedPhaseId != ElementId.InvalidElementId)
+                        return elem.Document.GetElement(elem.CreatedPhaseId)?.Name;
+                }
+                catch { }
+                return null;
+            }
+            if (paramName.Equals("RoomName", StringComparison.OrdinalIgnoreCase) ||
+                paramName.Equals("RoomNumber", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    if (elem is FamilyInstance fi && fi.Room != null)
+                        return paramName.Equals("RoomNumber", StringComparison.OrdinalIgnoreCase) ? fi.Room.Number : fi.Room.Name;
+                }
+                catch { }
+                return null;
+            }
+            if (paramName.Equals("SpaceName", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    if (elem is FamilyInstance fiSpace && fiSpace.Space != null)
+                        return fiSpace.Space.Name;
+                }
+                catch { }
+                return null;
+            }
 
             Parameter? p = elem.LookupParameter(paramName) ?? type?.LookupParameter(paramName);
             if ((p == null || !p.HasValue) && paramName.Equals("Level", StringComparison.OrdinalIgnoreCase))
@@ -3711,6 +4215,7 @@ namespace RevitLocationExporter.Commands
         {
             var p = e.LookupParameter(name);
             if (p == null || p.IsReadOnly) return false;
+            if (p.HasValue && Math.Abs(p.AsDouble() - val) < 1e-9) return false;
             p.Set(val);
             return true;
         }
@@ -3719,6 +4224,7 @@ namespace RevitLocationExporter.Commands
         {
             var p = e.LookupParameter(name);
             if (p == null || p.IsReadOnly) return false;
+            if (string.Equals(p.AsString() ?? string.Empty, val, StringComparison.Ordinal)) return false;
             p.Set(val);
             return true;
         }
@@ -3743,31 +4249,92 @@ namespace RevitLocationExporter.Commands
             return string.Join(RevitLineBreak, lines);
         }
 
-        private static void SetParamValue(Parameter param, string raw)
+        private static readonly Regex UnitSuffixRegex = new(
+            @"^\s*([+-]?\d+(?:[.,]\d+)?)\s*(mm|cm|m|ft|in|deg|m2|m3)\s*$",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        private static bool TryParseDoubleWithUnit(string raw, out double internalVal)
+        {
+            string s = (raw ?? string.Empty).Trim();
+            if (double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out internalVal))
+                return true;
+
+            var m = UnitSuffixRegex.Match(s);
+            if (m.Success &&
+                double.TryParse(m.Groups[1].Value.Replace(',', '.'), NumberStyles.Float, CultureInfo.InvariantCulture, out double num))
+            {
+                string unit = m.Groups[2].Value.ToLowerInvariant();
+                ForgeTypeId? unitId = unit switch
+                {
+                    "mm" => UnitTypeId.Millimeters,
+                    "cm" => UnitTypeId.Centimeters,
+                    "m" => UnitTypeId.Meters,
+                    "ft" => UnitTypeId.Feet,
+                    "in" => UnitTypeId.Inches,
+                    "deg" => UnitTypeId.Degrees,
+                    "m2" => UnitTypeId.SquareMeters,
+                    "m3" => UnitTypeId.CubicMeters,
+                    _ => null
+                };
+                if (unitId != null)
+                {
+                    internalVal = UnitUtils.ConvertToInternalUnits(num, unitId);
+                    return true;
+                }
+            }
+
+            internalVal = 0;
+            return false;
+        }
+
+        private static void SetParamValue(Parameter param, string raw) =>
+            SetParamValueIfChanged(param, raw);
+
+        private static bool SetParamValueIfChanged(Parameter param, string raw)
         {
             switch (param.StorageType)
             {
                 case StorageType.String:
-                    param.Set(NormalizeLineBreaks(raw));
-                    break;
+                {
+                    string normalized = NormalizeLineBreaks(raw);
+                    string current = param.AsString() ?? string.Empty;
+                    if (string.Equals(current, normalized, StringComparison.Ordinal))
+                        return false;
+                    param.Set(normalized);
+                    return true;
+                }
 
                 case StorageType.Double:
-                    if (double.TryParse(raw, System.Globalization.NumberStyles.Any,
-                                        System.Globalization.CultureInfo.InvariantCulture, out double d))
+                {
+                    if (TryParseDoubleWithUnit(raw, out double d))
+                    {
+                        if (param.HasValue && Math.Abs(param.AsDouble() - d) < 1e-9)
+                            return false;
                         param.Set(d);
-                    break;
+                        return true;
+                    }
+                    return false;
+                }
 
                 case StorageType.Integer:
-                    string v = raw.Trim();
+                {
+                    string v = (raw ?? string.Empty).Trim();
                     if (v.Equals("Yes", StringComparison.OrdinalIgnoreCase) || v.Equals("True", StringComparison.OrdinalIgnoreCase))
                         v = "1";
                     else if (v.Equals("No", StringComparison.OrdinalIgnoreCase) || v.Equals("False", StringComparison.OrdinalIgnoreCase))
                         v = "0";
 
                     if (int.TryParse(v, out int i))
+                    {
+                        if (param.HasValue && param.AsInteger() == i)
+                            return false;
                         param.Set(i);
-                    break;
+                        return true;
+                    }
+                    return false;
+                }
             }
+            return false;
         }
 
     }

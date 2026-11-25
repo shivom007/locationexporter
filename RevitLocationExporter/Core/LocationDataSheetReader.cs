@@ -848,12 +848,19 @@ namespace RevitLocationExporter.Core
         /// </summary>
         public List<StandardsFillRow> StandardsFillRows { get; set; } = new();
 
+        /// <summary>
+        /// All non-meta worksheet tables keyed by worksheet name (enables XLOOKUP formulas).
+        /// </summary>
+        public Dictionary<string, List<Dictionary<string, string>>> LookupTables { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
         public bool HasData =>
             ElementParameters.Count > 0 ||
             SheetParameters.Count > 0 ||
             SheetNumberParameters.Count > 0 ||
             ExportLocations.Count > 0 ||
-            StandardsFillRows.Count > 0;
+            StandardsFillRows.Count > 0 ||
+            LookupTables.Count > 0;
 
         public Dictionary<string, string>? GetElementParams(string locationName)
         {
@@ -943,84 +950,143 @@ namespace RevitLocationExporter.Core
             return bundle;
         }
 
-        private static void ReadExcelBundle(string filePath, LocationParameterBundle bundle)
+        public static LocationParameterBundle ReadParameterBundle(NativeWorkbook workbook, string? sourcePath = null)
         {
+            var bundle = new LocationParameterBundle { SourcePath = sourcePath ?? string.Empty };
+            if (workbook == null) return bundle;
+
             try
             {
-                var workbook = NativeXlsxEngine.Open(filePath);
-                var worksheets = workbook.Sheets;
-                if (worksheets.Count == 0) return;
-
-                var dataSheets = worksheets.Where(w => !IsProfileMetaTab(w.Name)).ToList();
-                if (dataSheets.Count == 0) return;
-
-                NativeWorksheet? elemWs = null;
-                NativeWorksheet? sheetWs = null;
-                NativeWorksheet? specificWs = null;
-                NativeWorksheet? exportWs = null;
-
-                if (dataSheets.Count == 1)
-                {
-                    elemWs = dataSheets[0];
-                    sheetWs = dataSheets[0];
-                    exportWs = dataSheets[0];
-                }
-                else
-                {
-                    specificWs = dataSheets.FirstOrDefault(w => IsSheetSpecificTab(w.Name));
-                    elemWs = dataSheets.FirstOrDefault(w => IsElementTab(w.Name));
-                    sheetWs = dataSheets.FirstOrDefault(w => IsCommonSheetTab(w.Name));
-                    exportWs = dataSheets.FirstOrDefault(w => IsExportTab(w.Name));
-
-                    elemWs ??= dataSheets[0];
-                    sheetWs ??= dataSheets.Count > 1 ? dataSheets[1] : dataSheets[0];
-                }
-
-                if (elemWs != null)
-                {
-                    bundle.ElementTabName = elemWs.Name;
-                    bundle.ElementParameters = ReadNativeWorksheet(elemWs);
-                }
-
-                if (sheetWs != null)
-                {
-                    bundle.SheetTabName = sheetWs.Name;
-                    bundle.SheetParameters = StripBlankValues(ReadNativeWorksheet(sheetWs), keepEmptyRows: true);
-                }
-
-                if (specificWs != null)
-                {
-                    bundle.SheetSpecificTabName = specificWs.Name;
-                    bundle.SheetNumberParameters = StripBlankValues(
-                        ReadNativeWorksheet(specificWs, IsSheetNumberHeader), keepEmptyRows: false);
-                }
-
-                if (worksheets.Count > 1)
-                {
-                    var standardsWs = worksheets.FirstOrDefault(w => StandardsFillWorkbookReader.IsStandardsTab(w.Name));
-                    if (standardsWs != null)
-                    {
-                        bundle.StandardsTabName = standardsWs.Name;
-                        bundle.StandardsFillRows = StandardsFillWorkbookReader.FromNativeWorksheet(standardsWs);
-                    }
-                }
-
-                if (exportWs != null)
-                {
-                    bundle.ExportTabName = exportWs.Name;
-                    bundle.ExportLocations = ReadNativeExportLocations(exportWs);
-                }
-
-                if (bundle.ExportLocations.Count == 0)
-                {
-                    ExtractExportLocationsFromParamMaps(bundle.ElementParameters, bundle.ExportLocations);
-                    ExtractExportLocationsFromParamMaps(bundle.SheetParameters, bundle.ExportLocations);
-                }
+                ReadIntoBundle(workbook, bundle);
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"Native Excel parser failed: {ex.Message}");
             }
+            return bundle;
+        }
+
+        private static void ReadExcelBundle(string filePath, LocationParameterBundle bundle)
+        {
+            try
+            {
+                var workbook = NativeXlsxEngine.Open(filePath);
+                ReadIntoBundle(workbook, bundle);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Native Excel parser failed: {ex.Message}");
+            }
+        }
+
+        private static void ReadIntoBundle(NativeWorkbook workbook, LocationParameterBundle bundle)
+        {
+            var worksheets = workbook.Sheets;
+            if (worksheets.Count == 0) return;
+
+            var dataSheets = worksheets.Where(w => !IsProfileMetaTab(w.Name)).ToList();
+            if (dataSheets.Count == 0) return;
+
+            foreach (var ws in dataSheets)
+            {
+                var rows = ReadGenericLookupTable(ws);
+                if (rows.Count > 0)
+                    bundle.LookupTables[ws.Name] = rows;
+            }
+
+            NativeWorksheet? elemWs = null;
+            NativeWorksheet? sheetWs = null;
+            NativeWorksheet? specificWs = null;
+            NativeWorksheet? exportWs = null;
+
+            if (dataSheets.Count == 1)
+            {
+                elemWs = dataSheets[0];
+                sheetWs = dataSheets[0];
+                exportWs = dataSheets[0];
+            }
+            else
+            {
+                specificWs = dataSheets.FirstOrDefault(w => IsSheetSpecificTab(w.Name));
+                elemWs = dataSheets.FirstOrDefault(w => IsElementTab(w.Name));
+                sheetWs = dataSheets.FirstOrDefault(w => IsCommonSheetTab(w.Name));
+                exportWs = dataSheets.FirstOrDefault(w => IsExportTab(w.Name));
+
+                elemWs ??= dataSheets[0];
+                sheetWs ??= dataSheets.Count > 1 ? dataSheets[1] : dataSheets[0];
+            }
+
+            if (elemWs != null)
+            {
+                bundle.ElementTabName = elemWs.Name;
+                bundle.ElementParameters = ReadNativeWorksheet(elemWs);
+            }
+
+            if (sheetWs != null)
+            {
+                bundle.SheetTabName = sheetWs.Name;
+                bundle.SheetParameters = StripBlankValues(ReadNativeWorksheet(sheetWs), keepEmptyRows: true);
+            }
+
+            if (specificWs != null)
+            {
+                bundle.SheetSpecificTabName = specificWs.Name;
+                bundle.SheetNumberParameters = StripBlankValues(
+                    ReadNativeWorksheet(specificWs, IsSheetNumberHeader), keepEmptyRows: false);
+            }
+
+            if (worksheets.Count > 1)
+            {
+                var standardsWs = worksheets.FirstOrDefault(w => StandardsFillWorkbookReader.IsStandardsTab(w.Name));
+                if (standardsWs != null)
+                {
+                    bundle.StandardsTabName = standardsWs.Name;
+                    bundle.StandardsFillRows = StandardsFillWorkbookReader.FromNativeWorksheet(standardsWs);
+                }
+            }
+
+            if (exportWs != null)
+            {
+                bundle.ExportTabName = exportWs.Name;
+                bundle.ExportLocations = ReadNativeExportLocations(exportWs);
+            }
+
+            if (bundle.ExportLocations.Count == 0)
+            {
+                ExtractExportLocationsFromParamMaps(bundle.ElementParameters, bundle.ExportLocations);
+                ExtractExportLocationsFromParamMaps(bundle.SheetParameters, bundle.ExportLocations);
+            }
+        }
+
+        private static List<Dictionary<string, string>> ReadGenericLookupTable(NativeWorksheet ws)
+        {
+            var list = new List<Dictionary<string, string>>();
+            int firstRow = ws.FirstNonEmptyRowNumber();
+            if (firstRow == 0) return list;
+
+            var colMap = new Dictionary<int, string>();
+            foreach (int col in ws.GetUsedColumnsInRow(firstRow))
+            {
+                string h = ws.GetEvaluatedText(firstRow, col);
+                if (!string.IsNullOrWhiteSpace(h))
+                    colMap[col] = h;
+            }
+            if (colMap.Count == 0) return list;
+
+            for (int r = firstRow + 1; r <= ws.MaxRow; r++)
+            {
+                if (ws.IsRowEmpty(r)) continue;
+                var rowDict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                bool any = false;
+                foreach (var kv in colMap)
+                {
+                    string v = ws.GetEvaluatedText(r, kv.Key);
+                    rowDict[kv.Value] = v;
+                    if (!string.IsNullOrWhiteSpace(v)) any = true;
+                }
+                if (any) list.Add(rowDict);
+            }
+            return list;
         }
 
         #region Tab / header detection helpers

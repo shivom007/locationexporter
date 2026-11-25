@@ -169,8 +169,8 @@ namespace RevitLocationExporter.Core
                 }
                 report.TextNoteRulesCount = profile.TextNoteRules.Count;
 
-                // 2. Read all data tabs (Element_Params, Sheet_Params, Sheet_Specific_Params, Standards_Fill, Export_Locations)
-                var bundle = LocationDataSheetReader.ReadParameterBundle(excelPath);
+                // 2. Read all data tabs using the already-opened workbook (single-pass ZIP open)
+                var bundle = LocationDataSheetReader.ReadParameterBundle(workbook, excelPath);
                 profile.SyncedData = SyncedExcelSnapshot.FromLocationParameterBundle(bundle);
 
                 report.ElementLocationsCount = bundle.ElementParameters.Count;
@@ -364,7 +364,7 @@ namespace RevitLocationExporter.Core
             int firstRow = ws.FirstNonEmptyRowNumber();
             if (firstRow == 0) return rules;
 
-            int enabledCol = -1, targetCol = -1, filterCol = -1, paramCol = -1, valCol = -1, modeCol = -1, notesCol = -1;
+            int enabledCol = -1, targetCol = -1, filterCol = -1, condCol = -1, paramCol = -1, valCol = -1, modeCol = -1, notesCol = -1;
 
             foreach (int col in ws.GetUsedColumnsInRow(firstRow))
             {
@@ -372,6 +372,7 @@ namespace RevitLocationExporter.Core
                 if (h == "enabled" || h == "on") enabledCol = col;
                 else if (h == "target" || h == "scope") targetCol = col;
                 else if (h == "filter" || h == "category") filterCol = col;
+                else if (h == "condition" || h == "when" || h == "if") condCol = col;
                 else if (h == "parameter" || h == "parametername" || h == "param") paramCol = col;
                 else if (h.Contains("value") || h.Contains("formula")) valCol = col;
                 else if (h == "mode" || h == "overwrite") modeCol = col;
@@ -390,6 +391,7 @@ namespace RevitLocationExporter.Core
 
                 // For Value_Or_Formula, preserve '=' formula text verbatim
                 string valueOrFormula = ws.GetFormulaOrText(r, valCol);
+                string condition = condCol > 0 ? ws.GetFormulaOrText(r, condCol) : string.Empty;
 
                 bool enabled = true;
                 if (enabledCol > 0)
@@ -428,6 +430,15 @@ namespace RevitLocationExporter.Core
 
                 string notes = notesCol > 0 ? ws.GetEvaluatedText(r, notesCol) : string.Empty;
 
+                if (!string.IsNullOrWhiteSpace(condition) &&
+                    !condition.Equals("TRUE", StringComparison.OrdinalIgnoreCase) &&
+                    !condition.Equals("FALSE", StringComparison.OrdinalIgnoreCase))
+                {
+                    string condExpr = condition.StartsWith("=", StringComparison.Ordinal) ? condition : "=" + condition;
+                    if (!ExcelFormulaEngine.Validate(condExpr, out string? cerr, out _))
+                        warnings.Add($"Parameter_Rules row {r} ({paramName}): condition formula warning — {cerr}");
+                }
+
                 if (valueOrFormula.StartsWith("=", StringComparison.Ordinal) &&
                     !ExcelFormulaEngine.Validate(valueOrFormula, out string? ferr, out _))
                 {
@@ -439,6 +450,7 @@ namespace RevitLocationExporter.Core
                     Enabled = enabled,
                     Target = target,
                     Filter = filter,
+                    Condition = condition,
                     ParameterName = paramName,
                     ValueOrFormula = valueOrFormula,
                     Mode = mode,
@@ -592,6 +604,7 @@ namespace RevitLocationExporter.Core
                         r.Enabled ? "TRUE" : "FALSE",
                         r.Target.ToString(),
                         string.IsNullOrWhiteSpace(r.Filter) ? "*" : r.Filter,
+                        r.Condition ?? string.Empty,
                         r.ParameterName,
                         r.ValueOrFormula,
                         r.Mode.ToString(),
@@ -601,20 +614,20 @@ namespace RevitLocationExporter.Core
             }
             else
             {
-                rulesRows.Add(new[] { "TRUE", "Element", "*", "CPK_Stage", "Projekt Budowlany", "FillIfEmpty", "Static default value" });
-                rulesRows.Add(new[] { "TRUE", "Element", "*", "CPK_WBS_Short", "=LEFT(RIGHT([CPK_WBS_5],2),1)&\".\"&RIGHT([CPK_WBS_5],1)", "Overwrite", "Example dependent formula (81 -> 8.1)" });
+                rulesRows.Add(new[] { "TRUE", "Element", "*", "", "CPK_Stage", "Projekt Budowlany", "FillIfEmpty", "Static default value" });
+                rulesRows.Add(new[] { "TRUE", "Element", "*", "", "CPK_WBS_Short", "=LEFT(RIGHT([CPK_WBS_5],2),1)&\".\"&RIGHT([CPK_WBS_5],1)", "Overwrite", "Example dependent formula (81 -> 8.1)" });
             }
             sheets.Add(new NativeSheetSpec
             {
                 Name = "Parameter_Rules",
-                Headers = new[] { "Enabled", "Target", "Filter", "Parameter", "Value_Or_Formula", "Mode", "Notes" },
+                Headers = new[] { "Enabled", "Target", "Filter", "Condition", "Parameter", "Value_Or_Formula", "Mode", "Notes" },
                 Rows = rulesRows,
-                TextColumns = new HashSet<int> { 5 },
+                TextColumns = new HashSet<int> { 4, 6 },
                 DataValidations =
                 {
                     ("A2:A200", "\"TRUE,FALSE\""),
-                    ("B2:B200", "\"Element,Sheet,Titleblock,SheetCover,ProjectInfo\""),
-                    ("F2:F200", "\"Overwrite,FillIfEmpty\"")
+                    ("B2:B200", "\"Element,ElementInstance,ElementType,ElementBoth,Sheet,Titleblock,SheetCover,ProjectInfo\""),
+                    ("G2:G200", "\"Overwrite,FillIfEmpty,SkipIfBlankResult,Append,Prepend,Clear\"")
                 }
             });
 

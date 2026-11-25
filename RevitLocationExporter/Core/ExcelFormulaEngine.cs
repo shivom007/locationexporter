@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -9,14 +10,35 @@ using RevitLocationExporter.Configuration;
 namespace RevitLocationExporter.Core
 {
     /// <summary>
-    /// Evaluates Excel-like formulas (=LEFT, =RIGHT, =MID, =IF, =IFERROR, &, comparisons, arithmetic)
-    /// against dynamic parameter lookups, with topological dependency sorting and cycle detection.
+    /// Evaluates Excel-like formulas (=LEFT, =RIGHT, =MID, =IF, =IFERROR, REGEX*, SPLIT, PADLEFT/RIGHT,
+    /// COALESCE, XLOOKUP, &, comparisons, arithmetic) against dynamic parameter lookups, with
+    /// cached AST compilation, topological dependency sorting, and condition evaluation.
     /// </summary>
     public static class ExcelFormulaEngine
     {
         public sealed class FormulaException : Exception
         {
             public FormulaException(string message) : base(message) { }
+        }
+
+        public delegate string? TableLookupFunc(string tableName, string keyColumn, string lookupValue, string returnColumn);
+
+        private static readonly ConcurrentDictionary<string, ExprNode> _astCache =
+            new(StringComparer.Ordinal);
+
+        private static readonly ConcurrentDictionary<string, Regex> _regexCache =
+            new(StringComparer.Ordinal);
+
+        internal readonly struct EvalContext
+        {
+            public readonly Func<string, string?> Resolver;
+            public readonly TableLookupFunc? TableLookup;
+
+            public EvalContext(Func<string, string?> resolver, TableLookupFunc? tableLookup)
+            {
+                Resolver = resolver;
+                TableLookup = tableLookup;
+            }
         }
 
         private enum TokenKind
@@ -61,9 +83,9 @@ namespace RevitLocationExporter.Core
             }
         }
 
-        private abstract class ExprNode
+        internal abstract class ExprNode
         {
-            public abstract object Evaluate(Func<string, string?> resolver);
+            public abstract object Evaluate(in EvalContext ctx);
             public abstract void CollectReferences(HashSet<string> refs);
         }
 
@@ -71,7 +93,7 @@ namespace RevitLocationExporter.Core
         {
             private readonly object _value;
             public LiteralNode(object value) { _value = value; }
-            public override object Evaluate(Func<string, string?> resolver) => _value;
+            public override object Evaluate(in EvalContext ctx) => _value;
             public override void CollectReferences(HashSet<string> refs) { }
         }
 
@@ -79,7 +101,7 @@ namespace RevitLocationExporter.Core
         {
             public readonly string Name;
             public ReferenceNode(string name) { Name = name; }
-            public override object Evaluate(Func<string, string?> resolver) => resolver(Name) ?? string.Empty;
+            public override object Evaluate(in EvalContext ctx) => ctx.Resolver(Name) ?? string.Empty;
             public override void CollectReferences(HashSet<string> refs) => refs.Add(Name);
         }
 
@@ -89,9 +111,9 @@ namespace RevitLocationExporter.Core
             private readonly ExprNode _inner;
             public UnaryNode(TokenKind op, ExprNode inner) { _op = op; _inner = inner; }
 
-            public override object Evaluate(Func<string, string?> resolver)
+            public override object Evaluate(in EvalContext ctx)
             {
-                double val = ToNumber(_inner.Evaluate(resolver));
+                double val = ToNumber(_inner.Evaluate(in ctx));
                 return _op == TokenKind.Minus ? -val : val;
             }
 
@@ -110,10 +132,10 @@ namespace RevitLocationExporter.Core
                 _right = right;
             }
 
-            public override object Evaluate(Func<string, string?> resolver)
+            public override object Evaluate(in EvalContext ctx)
             {
-                object l = _left.Evaluate(resolver);
-                object r = _right.Evaluate(resolver);
+                object l = _left.Evaluate(in ctx);
+                object r = _right.Evaluate(in ctx);
 
                 switch (_op)
                 {
@@ -163,7 +185,7 @@ namespace RevitLocationExporter.Core
                 _args = args;
             }
 
-            public override object Evaluate(Func<string, string?> resolver) => EvaluateFunction(_name, _args, resolver);
+            public override object Evaluate(in EvalContext ctx) => EvaluateFunction(_name, _args, in ctx);
 
             public override void CollectReferences(HashSet<string> refs)
             {
@@ -171,9 +193,237 @@ namespace RevitLocationExporter.Core
             }
         }
 
+        // ── Compiled Rule Set (Zero Re-Parse / Zero Re-Sort Across Elements) ─
+
+        internal sealed class CompiledRuleEntry
+        {
+            public int Index;
+            public ParameterRule Rule = null!;
+            public string ParameterName = string.Empty;
+            public ExprNode? ValueAst;
+            public string? ValueCompileError;
+            public bool HasCondition;
+            public ExprNode? ConditionAst;
+            public bool StaticConditionValue = true;
+            public string? ConditionCompileError;
+        }
+
+        public sealed class CompiledRuleSet
+        {
+            private readonly IList<ParameterRule> _rules;
+            private readonly CompiledRuleEntry?[] _entries;
+            private readonly List<int> _executionOrder;
+            private readonly List<(int Index, string Message)> _circularErrors;
+
+            public HashSet<string> AllReferencedTokens { get; }
+            public int ActiveCount { get; }
+
+            internal CompiledRuleSet(
+                IList<ParameterRule> rules,
+                CompiledRuleEntry?[] entries,
+                List<int> executionOrder,
+                List<(int Index, string Message)> circularErrors,
+                HashSet<string> allReferencedTokens,
+                int activeCount)
+            {
+                _rules = rules;
+                _entries = entries;
+                _executionOrder = executionOrder;
+                _circularErrors = circularErrors;
+                AllReferencedTokens = allReferencedTokens;
+                ActiveCount = activeCount;
+            }
+
+            public List<(ParameterRule Rule, string Value, string? Error, bool ConditionMet)> EvaluateOrdered(
+                Func<string, string?> baseLookup,
+                out List<string> warnings,
+                TableLookupFunc? tableLookup = null)
+            {
+                warnings = new List<string>();
+                if (_rules.Count == 0)
+                    return new List<(ParameterRule, string, string?, bool)>();
+
+                var output = new (ParameterRule Rule, string Value, string? Error, bool ConditionMet)[_rules.Count];
+                for (int i = 0; i < _rules.Count; i++)
+                {
+                    if (_entries[i] == null)
+                        output[i] = (_rules[i], string.Empty, null, false);
+                }
+
+                foreach (var (cycIdx, msg) in _circularErrors)
+                {
+                    warnings.Add(msg);
+                    output[cycIdx] = (_rules[cycIdx], string.Empty, msg, false);
+                }
+
+                var resolved = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+                string? LookupForRule(string selfParamName, string refName)
+                {
+                    if (!string.Equals(selfParamName, refName, StringComparison.OrdinalIgnoreCase) &&
+                        resolved.TryGetValue(refName, out var computed))
+                    {
+                        return computed;
+                    }
+                    return baseLookup?.Invoke(refName);
+                }
+
+                foreach (int idx in _executionOrder)
+                {
+                    var entry = _entries[idx]!;
+                    var rule = entry.Rule;
+                    string pName = entry.ParameterName;
+
+                    Func<string, string?> ruleLookup = k => LookupForRule(pName, k);
+                    var ctx = new EvalContext(ruleLookup, tableLookup);
+
+                    // 1. Check optional Condition before evaluating/applying rule
+                    if (entry.HasCondition)
+                    {
+                        if (entry.ConditionCompileError != null)
+                        {
+                            warnings.Add($"Rule '{pName}' condition error: {entry.ConditionCompileError}");
+                            output[idx] = (rule, string.Empty, $"Condition: {entry.ConditionCompileError}", false);
+                            continue;
+                        }
+
+                        bool condMet;
+                        if (entry.ConditionAst != null)
+                        {
+                            try
+                            {
+                                condMet = ToBool(entry.ConditionAst.Evaluate(in ctx));
+                            }
+                            catch (Exception ex)
+                            {
+                                warnings.Add($"Rule '{pName}' condition error: {ex.Message}");
+                                output[idx] = (rule, string.Empty, $"Condition: {ex.Message}", false);
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            condMet = entry.StaticConditionValue;
+                        }
+
+                        if (!condMet)
+                        {
+                            output[idx] = (rule, string.Empty, null, false);
+                            continue;
+                        }
+                    }
+
+                    // 2. Evaluate value or static literal
+                    if (!rule.IsFormula)
+                    {
+                        string lit = rule.ValueOrFormula ?? string.Empty;
+                        resolved[pName] = lit;
+                        output[idx] = (rule, lit, null, true);
+                    }
+                    else if (entry.ValueCompileError != null)
+                    {
+                        warnings.Add($"Rule '{pName}' formula error: {entry.ValueCompileError}");
+                        output[idx] = (rule, string.Empty, entry.ValueCompileError, true);
+                    }
+                    else
+                    {
+                        try
+                        {
+                            string val = ToStr(entry.ValueAst!.Evaluate(in ctx));
+                            resolved[pName] = val;
+                            output[idx] = (rule, val, null, true);
+                        }
+                        catch (Exception ex)
+                        {
+                            warnings.Add($"Rule '{pName}' formula error: {ex.Message}");
+                            output[idx] = (rule, string.Empty, ex.Message, true);
+                        }
+                    }
+                }
+
+                return output.ToList();
+            }
+
+            public Dictionary<string, (ParameterRule Rule, string Value)> EvaluateMap(
+                Func<string, string?> baseLookup,
+                out List<string> warnings,
+                TableLookupFunc? tableLookup = null)
+            {
+                var map = new Dictionary<string, (ParameterRule Rule, string Value)>(StringComparer.OrdinalIgnoreCase);
+                if (ActiveCount == 0)
+                {
+                    warnings = new List<string>();
+                    return map;
+                }
+
+                var ordered = EvaluateOrdered(baseLookup, out warnings, tableLookup);
+                foreach (var item in ordered)
+                {
+                    if (item.ConditionMet && item.Error == null && item.Rule != null && !string.IsNullOrWhiteSpace(item.Rule.ParameterName))
+                    {
+                        map[item.Rule.ParameterName.Trim()] = (item.Rule, item.Value);
+                    }
+                }
+                return map;
+            }
+        }
+
         // ── Public API ───────────────────────────────────────────────────────
 
-        public static string Evaluate(string expression, Func<string, string?> resolver)
+        private static ExprNode ParseCached(string body) => _astCache.GetOrAdd(body, Parse);
+
+        private static Regex GetCachedRegex(string pattern) =>
+            _regexCache.GetOrAdd(pattern, p => new Regex(p, RegexOptions.Compiled));
+
+        public static TableLookupFunc CreateTableLookup(IDictionary<string, List<Dictionary<string, string>>>? tables)
+        {
+            if (tables == null || tables.Count == 0)
+                return (_, _, _, _) => null;
+
+            var indexCache = new ConcurrentDictionary<string, Dictionary<string, Dictionary<string, string>>>(StringComparer.OrdinalIgnoreCase);
+
+            return (tableName, keyColumn, lookupValue, returnColumn) =>
+            {
+                if (string.IsNullOrWhiteSpace(tableName) || string.IsNullOrWhiteSpace(keyColumn) || string.IsNullOrWhiteSpace(returnColumn))
+                    return null;
+
+                if (!tables.TryGetValue(tableName.Trim(), out var rows) || rows == null || rows.Count == 0)
+                    return null;
+
+                string tName = tableName.Trim();
+                string kCol = keyColumn.Trim();
+                string cacheKey = $"{tName}\0{kCol}";
+
+                var rowIndex = indexCache.GetOrAdd(cacheKey, _ =>
+                {
+                    var dict = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var row in rows)
+                    {
+                        if (row != null && row.TryGetValue(kCol, out string? kVal) && !string.IsNullOrWhiteSpace(kVal))
+                        {
+                            string trimmedKey = kVal.Trim();
+                            if (!dict.ContainsKey(trimmedKey))
+                                dict[trimmedKey] = row;
+                        }
+                    }
+                    return dict;
+                });
+
+                string needle = (lookupValue ?? string.Empty).Trim();
+                if (rowIndex.TryGetValue(needle, out var hit) && hit.TryGetValue(returnColumn.Trim(), out var val))
+                    return val;
+
+                if (rowIndex.TryGetValue("*", out var wildcardHit) && wildcardHit.TryGetValue(returnColumn.Trim(), out var wVal))
+                    return wVal;
+
+                return null;
+            };
+        }
+
+        public static string Evaluate(string expression, Func<string, string?> resolver) =>
+            Evaluate(expression, resolver, null);
+
+        public static string Evaluate(string expression, Func<string, string?> resolver, TableLookupFunc? tableLookup)
         {
             if (string.IsNullOrEmpty(expression)) return string.Empty;
             string trimmed = expression.TrimStart();
@@ -181,8 +431,9 @@ namespace RevitLocationExporter.Core
                 return expression;
 
             string body = trimmed.Substring(1);
-            var ast = Parse(body);
-            object val = ast.Evaluate(resolver ?? (_ => string.Empty));
+            var ast = ParseCached(body);
+            var ctx = new EvalContext(resolver ?? (_ => string.Empty), tableLookup);
+            object val = ast.Evaluate(in ctx);
             return ToStr(val);
         }
 
@@ -190,11 +441,19 @@ namespace RevitLocationExporter.Core
             string expression,
             Func<string, string?> resolver,
             out string result,
+            out string? error) =>
+            TryEvaluate(expression, resolver, null, out result, out error);
+
+        public static bool TryEvaluate(
+            string expression,
+            Func<string, string?> resolver,
+            TableLookupFunc? tableLookup,
+            out string result,
             out string? error)
         {
             try
             {
-                result = Evaluate(expression, resolver);
+                result = Evaluate(expression, resolver, tableLookup);
                 error = null;
                 return true;
             }
@@ -217,7 +476,7 @@ namespace RevitLocationExporter.Core
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
-                var ast = Parse(trimmed.Substring(1));
+                var ast = ParseCached(trimmed.Substring(1));
                 var astRefs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 ast.CollectReferences(astRefs);
                 foreach (var r in astRefs)
@@ -227,7 +486,6 @@ namespace RevitLocationExporter.Core
             }
             catch
             {
-                // Fallback regex scan if expression has partial syntax while typing
                 foreach (Match m in Regex.Matches(trimmed, @"\[([^\[\]]+)\]|\{([^\{\}]+)\}"))
                 {
                     string name = (m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value).Trim();
@@ -250,7 +508,7 @@ namespace RevitLocationExporter.Core
 
             try
             {
-                var ast = Parse(trimmed.Substring(1));
+                var ast = ParseCached(trimmed.Substring(1));
                 var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 ast.CollectReferences(set);
                 references.AddRange(set);
@@ -264,56 +522,90 @@ namespace RevitLocationExporter.Core
             }
         }
 
-        /// <summary>
-        /// Evaluates enabled ParameterRules in topological dependency order and returns a dictionary
-        /// keyed by ParameterName. Circular dependencies emit warnings without throwing.
-        /// </summary>
-        public static Dictionary<string, (ParameterRule Rule, string Value)> ResolveRulesInOrder(
-            IList<ParameterRule> rules,
-            Func<string, string?> baseLookup,
-            out List<string> warnings)
+        public static CompiledRuleSet CompileRules(IList<ParameterRule> rules)
         {
-            var orderedResults = EvaluateRulesOrdered(rules, baseLookup, out warnings);
-            var map = new Dictionary<string, (ParameterRule Rule, string Value)>(StringComparer.OrdinalIgnoreCase);
-            foreach (var item in orderedResults)
-            {
-                if (item.Error == null && !string.IsNullOrWhiteSpace(item.Rule.ParameterName))
-                {
-                    map[item.Rule.ParameterName.Trim()] = (item.Rule, item.Value);
-                }
-            }
-            return map;
-        }
-
-        /// <summary>
-        /// Evaluates all enabled rules in dependency order and returns per-rule results aligned with the input list
-        /// (plus evaluation errors per rule, e.g. for UI DataGrid preview).
-        /// </summary>
-        public static List<(ParameterRule Rule, string Value, string? Error)> EvaluateRulesOrdered(
-            IList<ParameterRule> rules,
-            Func<string, string?> baseLookup,
-            out List<string> warnings)
-        {
-            warnings = new List<string>();
+            var emptyRefs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (rules == null || rules.Count == 0)
-                return new List<(ParameterRule, string, string?)>();
+            {
+                return new CompiledRuleSet(
+                    Array.Empty<ParameterRule>(),
+                    Array.Empty<CompiledRuleEntry?>(),
+                    new List<int>(),
+                    new List<(int, string)>(),
+                    emptyRefs,
+                    0);
+            }
 
-            var output = new (ParameterRule Rule, string Value, string? Error)[rules.Count];
-
-            // Build rule index lookup per parameter name (only enabled rules with non-empty ParameterName)
+            var entries = new CompiledRuleEntry?[rules.Count];
             var paramToIndices = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var activeIndices = new List<int>();
+            var allRefs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             for (int i = 0; i < rules.Count; i++)
             {
                 var r = rules[i];
                 if (r == null || !r.Enabled || string.IsNullOrWhiteSpace(r.ParameterName))
-                {
-                    output[i] = (r!, string.Empty, null);
                     continue;
-                }
-                activeIndices.Add(i);
+
                 string pName = r.ParameterName.Trim();
+                var entry = new CompiledRuleEntry
+                {
+                    Index = i,
+                    Rule = r,
+                    ParameterName = pName
+                };
+
+                if (r.IsFormula)
+                {
+                    try
+                    {
+                        entry.ValueAst = ParseCached(r.ValueOrFormula.TrimStart().Substring(1));
+                    }
+                    catch (Exception ex)
+                    {
+                        entry.ValueCompileError = ex.Message;
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(r.Condition))
+                {
+                    entry.HasCondition = true;
+                    string condTrim = r.Condition.Trim();
+                    if (condTrim.StartsWith("=", StringComparison.Ordinal))
+                    {
+                        try
+                        {
+                            entry.ConditionAst = ParseCached(condTrim.Substring(1));
+                        }
+                        catch (Exception ex)
+                        {
+                            entry.ConditionCompileError = ex.Message;
+                        }
+                    }
+                    else if (condTrim.Equals("TRUE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        entry.StaticConditionValue = true;
+                    }
+                    else if (condTrim.Equals("FALSE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        entry.StaticConditionValue = false;
+                    }
+                    else
+                    {
+                        try
+                        {
+                            entry.ConditionAst = ParseCached(condTrim);
+                        }
+                        catch (Exception ex)
+                        {
+                            entry.ConditionCompileError = ex.Message;
+                        }
+                    }
+                }
+
+                entries[i] = entry;
+                activeIndices.Add(i);
+
                 if (!paramToIndices.TryGetValue(pName, out var list))
                 {
                     list = new List<int>();
@@ -322,7 +614,6 @@ namespace RevitLocationExporter.Core
                 list.Add(i);
             }
 
-            // Build dependency graph among active rule indices
             var deps = new Dictionary<int, HashSet<int>>();
             var dependents = new Dictionary<int, List<int>>();
             var inDegree = new Dictionary<int, int>();
@@ -336,15 +627,21 @@ namespace RevitLocationExporter.Core
 
             foreach (int idx in activeIndices)
             {
-                var r = rules[idx];
-                if (!r.IsFormula) continue;
+                var entry = entries[idx]!;
+                var refs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                entry.ValueAst?.CollectReferences(refs);
+                entry.ConditionAst?.CollectReferences(refs);
+                if (entry.Rule.IsFormula && entry.ValueAst == null)
+                {
+                    foreach (var r in ExtractReferences(entry.Rule.ValueOrFormula)) refs.Add(r);
+                }
 
-                var refs = ExtractReferences(r.ValueOrFormula);
-                string selfName = r.ParameterName.Trim();
                 foreach (string refName in refs)
                 {
-                    if (string.Equals(refName, selfName, StringComparison.OrdinalIgnoreCase))
-                        continue; // self-reference falls back to baseLookup
+                    allRefs.Add(refName);
+
+                    if (string.Equals(refName, entry.ParameterName, StringComparison.OrdinalIgnoreCase))
+                        continue;
 
                     if (paramToIndices.TryGetValue(refName, out var providerIndices))
                     {
@@ -360,7 +657,6 @@ namespace RevitLocationExporter.Core
                 }
             }
 
-            // Kahn's topological sort prioritizing non-formula rules first, then original index
             var ready = new SortedSet<(int IsFormulaRank, int Index)>();
             foreach (int idx in activeIndices)
             {
@@ -383,57 +679,51 @@ namespace RevitLocationExporter.Core
                 }
             }
 
-            // Remaining nodes with inDegree > 0 are part of or blocked by circular dependencies
-            var cyclicSet = new HashSet<int>(activeIndices.Where(i => inDegree[i] > 0));
-            foreach (int cycIdx in cyclicSet)
+            var circularErrors = new List<(int Index, string Message)>();
+            foreach (int cycIdx in activeIndices)
             {
-                string pName = rules[cycIdx].ParameterName.Trim();
-                string errMsg = $"Circular reference detected involving [{pName}].";
-                warnings.Add(errMsg);
-                output[cycIdx] = (rules[cycIdx], string.Empty, errMsg);
-            }
-
-            // Evaluate in dependency order, accumulating resolved values
-            var resolved = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-            string? LookupForRule(string selfParamName, string refName)
-            {
-                // Avoid reading own newly written value if referencing self
-                if (!string.Equals(selfParamName, refName, StringComparison.OrdinalIgnoreCase) &&
-                    resolved.TryGetValue(refName, out var computed))
+                if (inDegree[cycIdx] > 0)
                 {
-                    return computed;
-                }
-                return baseLookup?.Invoke(refName);
-            }
-
-            foreach (int idx in executionOrder)
-            {
-                var rule = rules[idx];
-                string pName = rule.ParameterName.Trim();
-
-                if (!rule.IsFormula)
-                {
-                    string lit = rule.ValueOrFormula ?? string.Empty;
-                    resolved[pName] = lit;
-                    output[idx] = (rule, lit, null);
-                }
-                else
-                {
-                    if (TryEvaluate(rule.ValueOrFormula, k => LookupForRule(pName, k), out string val, out string? err))
-                    {
-                        resolved[pName] = val;
-                        output[idx] = (rule, val, null);
-                    }
-                    else
-                    {
-                        warnings.Add($"Rule '{pName}' formula error: {err}");
-                        output[idx] = (rule, string.Empty, err);
-                    }
+                    circularErrors.Add((cycIdx, $"Circular reference detected involving [{entries[cycIdx]!.ParameterName}]."));
                 }
             }
 
-            return output.ToList();
+            return new CompiledRuleSet(rules, entries, executionOrder, circularErrors, allRefs, activeIndices.Count);
+        }
+
+        public static Dictionary<string, (ParameterRule Rule, string Value)> ResolveRulesInOrder(
+            IList<ParameterRule> rules,
+            Func<string, string?> baseLookup,
+            out List<string> warnings) =>
+            ResolveRulesInOrder(rules, baseLookup, null, out warnings);
+
+        public static Dictionary<string, (ParameterRule Rule, string Value)> ResolveRulesInOrder(
+            IList<ParameterRule> rules,
+            Func<string, string?> baseLookup,
+            TableLookupFunc? tableLookup,
+            out List<string> warnings) =>
+            CompileRules(rules).EvaluateMap(baseLookup, out warnings, tableLookup);
+
+        public static List<(ParameterRule Rule, string Value, string? Error)> EvaluateRulesOrdered(
+            IList<ParameterRule> rules,
+            Func<string, string?> baseLookup,
+            out List<string> warnings) =>
+            EvaluateRulesOrdered(rules, baseLookup, null, out warnings);
+
+        public static List<(ParameterRule Rule, string Value, string? Error)> EvaluateRulesOrdered(
+            IList<ParameterRule> rules,
+            Func<string, string?> baseLookup,
+            TableLookupFunc? tableLookup,
+            out List<string> warnings)
+        {
+            var results = CompileRules(rules).EvaluateOrdered(baseLookup, out warnings, tableLookup);
+            var list = new List<(ParameterRule Rule, string Value, string? Error)>(results.Count);
+            foreach (var item in results)
+            {
+                string val = item.ConditionMet ? item.Value : string.Empty;
+                list.Add((item.Rule, val, item.Error));
+            }
+            return list;
         }
 
         // ── Tokenizer & Recursive-Descent Parser ─────────────────────────────
@@ -701,7 +991,7 @@ namespace RevitLocationExporter.Core
 
         // ── Function Implementations ─────────────────────────────────────────
 
-        private static object EvaluateFunction(string name, List<ExprNode> args, Func<string, string?> resolver)
+        private static object EvaluateFunction(string name, List<ExprNode> args, in EvalContext ctx)
         {
             switch (name)
             {
@@ -709,64 +999,87 @@ namespace RevitLocationExporter.Core
                 case "IF":
                 {
                     RequireArgs(name, args, 2, 3);
-                    bool cond = ToBool(args[0].Evaluate(resolver));
-                    if (cond) return args[1].Evaluate(resolver);
-                    return args.Count >= 3 ? args[2].Evaluate(resolver) : false;
+                    bool cond = ToBool(args[0].Evaluate(in ctx));
+                    if (cond) return args[1].Evaluate(in ctx);
+                    return args.Count >= 3 ? args[2].Evaluate(in ctx) : false;
                 }
                 case "IFERROR":
                 {
                     RequireArgs(name, args, 2, 2);
-                    try { return args[0].Evaluate(resolver); }
-                    catch (FormulaException) { return args[1].Evaluate(resolver); }
+                    try { return args[0].Evaluate(in ctx); }
+                    catch (FormulaException) { return args[1].Evaluate(in ctx); }
                 }
                 case "AND":
                 {
                     RequireArgs(name, args, 1, 64);
                     foreach (var a in args)
-                        if (!ToBool(a.Evaluate(resolver))) return false;
+                        if (!ToBool(a.Evaluate(in ctx))) return false;
                     return true;
                 }
                 case "OR":
                 {
                     RequireArgs(name, args, 1, 64);
                     foreach (var a in args)
-                        if (ToBool(a.Evaluate(resolver))) return true;
+                        if (ToBool(a.Evaluate(in ctx))) return true;
                     return false;
                 }
                 case "NOT":
                 {
                     RequireArgs(name, args, 1, 1);
-                    return !ToBool(args[0].Evaluate(resolver));
+                    return !ToBool(args[0].Evaluate(in ctx));
                 }
                 case "ISBLANK":
                 {
                     RequireArgs(name, args, 1, 1);
-                    return string.IsNullOrWhiteSpace(ToStr(args[0].Evaluate(resolver)));
+                    return string.IsNullOrWhiteSpace(ToStr(args[0].Evaluate(in ctx)));
+                }
+                case "COALESCE":
+                {
+                    RequireArgs(name, args, 1, 64);
+                    foreach (var a in args)
+                    {
+                        string val = ToStr(a.Evaluate(in ctx));
+                        if (!string.IsNullOrWhiteSpace(val))
+                            return val;
+                    }
+                    return string.Empty;
+                }
+                case "XLOOKUP":
+                {
+                    RequireArgs(name, args, 4, 5);
+                    string lookupVal = ToStr(args[0].Evaluate(in ctx));
+                    string tableName = ToStr(args[1].Evaluate(in ctx));
+                    string keyCol = ToStr(args[2].Evaluate(in ctx));
+                    string retCol = ToStr(args[3].Evaluate(in ctx));
+
+                    string? found = ctx.TableLookup?.Invoke(tableName, keyCol, lookupVal, retCol);
+                    if (found != null) return found;
+                    return args.Count >= 5 ? args[4].Evaluate(in ctx) : string.Empty;
                 }
 
                 // Text functions
                 case "LEFT":
                 {
                     RequireArgs(name, args, 1, 2);
-                    string s = ToStr(args[0].Evaluate(resolver));
-                    int n = args.Count >= 2 ? ToInt(args[1].Evaluate(resolver)) : 1;
+                    string s = ToStr(args[0].Evaluate(in ctx));
+                    int n = args.Count >= 2 ? ToInt(args[1].Evaluate(in ctx)) : 1;
                     if (n < 0) throw new FormulaException("#VALUE! (LEFT count < 0)");
                     return n >= s.Length ? s : s.Substring(0, n);
                 }
                 case "RIGHT":
                 {
                     RequireArgs(name, args, 1, 2);
-                    string s = ToStr(args[0].Evaluate(resolver));
-                    int n = args.Count >= 2 ? ToInt(args[1].Evaluate(resolver)) : 1;
+                    string s = ToStr(args[0].Evaluate(in ctx));
+                    int n = args.Count >= 2 ? ToInt(args[1].Evaluate(in ctx)) : 1;
                     if (n < 0) throw new FormulaException("#VALUE! (RIGHT count < 0)");
                     return n >= s.Length ? s : s.Substring(s.Length - n, n);
                 }
                 case "MID":
                 {
                     RequireArgs(name, args, 3, 3);
-                    string s = ToStr(args[0].Evaluate(resolver));
-                    int start = ToInt(args[1].Evaluate(resolver));
-                    int count = ToInt(args[2].Evaluate(resolver));
+                    string s = ToStr(args[0].Evaluate(in ctx));
+                    int start = ToInt(args[1].Evaluate(in ctx));
+                    int count = ToInt(args[2].Evaluate(in ctx));
                     if (start < 1 || count < 0) throw new FormulaException("#VALUE! (MID invalid start/count)");
                     int idx0 = start - 1;
                     if (idx0 >= s.Length || count == 0) return string.Empty;
@@ -776,14 +1089,14 @@ namespace RevitLocationExporter.Core
                 case "LEN":
                 {
                     RequireArgs(name, args, 1, 1);
-                    return (double)ToStr(args[0].Evaluate(resolver)).Length;
+                    return (double)ToStr(args[0].Evaluate(in ctx)).Length;
                 }
                 case "FIND":
                 {
                     RequireArgs(name, args, 2, 3);
-                    string find = ToStr(args[0].Evaluate(resolver));
-                    string within = ToStr(args[1].Evaluate(resolver));
-                    int start = args.Count >= 3 ? ToInt(args[2].Evaluate(resolver)) : 1;
+                    string find = ToStr(args[0].Evaluate(in ctx));
+                    string within = ToStr(args[1].Evaluate(in ctx));
+                    int start = args.Count >= 3 ? ToInt(args[2].Evaluate(in ctx)) : 1;
                     if (start < 1 || start > within.Length + 1) throw new FormulaException("#VALUE! (FIND start out of range)");
                     int idx = within.IndexOf(find, start - 1, StringComparison.Ordinal);
                     if (idx < 0) throw new FormulaException($"#VALUE! (FIND '{find}' not found)");
@@ -792,9 +1105,9 @@ namespace RevitLocationExporter.Core
                 case "SEARCH":
                 {
                     RequireArgs(name, args, 2, 3);
-                    string find = ToStr(args[0].Evaluate(resolver));
-                    string within = ToStr(args[1].Evaluate(resolver));
-                    int start = args.Count >= 3 ? ToInt(args[2].Evaluate(resolver)) : 1;
+                    string find = ToStr(args[0].Evaluate(in ctx));
+                    string within = ToStr(args[1].Evaluate(in ctx));
+                    int start = args.Count >= 3 ? ToInt(args[2].Evaluate(in ctx)) : 1;
                     if (start < 1 || start > within.Length + 1) throw new FormulaException("#VALUE! (SEARCH start out of range)");
                     if (find.IndexOf('*') >= 0 || find.IndexOf('?') >= 0)
                     {
@@ -810,15 +1123,15 @@ namespace RevitLocationExporter.Core
                 case "SUBSTITUTE":
                 {
                     RequireArgs(name, args, 3, 4);
-                    string text = ToStr(args[0].Evaluate(resolver));
-                    string oldText = ToStr(args[1].Evaluate(resolver));
-                    string newText = ToStr(args[2].Evaluate(resolver));
+                    string text = ToStr(args[0].Evaluate(in ctx));
+                    string oldText = ToStr(args[1].Evaluate(in ctx));
+                    string newText = ToStr(args[2].Evaluate(in ctx));
                     if (string.IsNullOrEmpty(oldText)) return text;
 
                     if (args.Count < 4)
                         return text.Replace(oldText, newText);
 
-                    int instance = ToInt(args[3].Evaluate(resolver));
+                    int instance = ToInt(args[3].Evaluate(in ctx));
                     if (instance < 1) throw new FormulaException("#VALUE! (SUBSTITUTE instance < 1)");
 
                     int pos = 0;
@@ -837,10 +1150,10 @@ namespace RevitLocationExporter.Core
                 case "REPLACE":
                 {
                     RequireArgs(name, args, 4, 4);
-                    string oldText = ToStr(args[0].Evaluate(resolver));
-                    int start = ToInt(args[1].Evaluate(resolver));
-                    int numChars = ToInt(args[2].Evaluate(resolver));
-                    string newText = ToStr(args[3].Evaluate(resolver));
+                    string oldText = ToStr(args[0].Evaluate(in ctx));
+                    int start = ToInt(args[1].Evaluate(in ctx));
+                    int numChars = ToInt(args[2].Evaluate(in ctx));
+                    string newText = ToStr(args[3].Evaluate(in ctx));
                     if (start < 1 || numChars < 0) throw new FormulaException("#VALUE! (REPLACE invalid start/count)");
                     int idx0 = Math.Min(start - 1, oldText.Length);
                     int delLen = Math.Min(numChars, oldText.Length - idx0);
@@ -849,37 +1162,37 @@ namespace RevitLocationExporter.Core
                 case "UPPER":
                 {
                     RequireArgs(name, args, 1, 1);
-                    return ToStr(args[0].Evaluate(resolver)).ToUpperInvariant();
+                    return ToStr(args[0].Evaluate(in ctx)).ToUpperInvariant();
                 }
                 case "LOWER":
                 {
                     RequireArgs(name, args, 1, 1);
-                    return ToStr(args[0].Evaluate(resolver)).ToLowerInvariant();
+                    return ToStr(args[0].Evaluate(in ctx)).ToLowerInvariant();
                 }
                 case "PROPER":
                 {
                     RequireArgs(name, args, 1, 1);
-                    string s = ToStr(args[0].Evaluate(resolver)).ToLowerInvariant();
+                    string s = ToStr(args[0].Evaluate(in ctx)).ToLowerInvariant();
                     return CultureInfo.InvariantCulture.TextInfo.ToTitleCase(s);
                 }
                 case "TRIM":
                 {
                     RequireArgs(name, args, 1, 1);
-                    string s = ToStr(args[0].Evaluate(resolver)).Trim();
+                    string s = ToStr(args[0].Evaluate(in ctx)).Trim();
                     return Regex.Replace(s, @"\s+", " ");
                 }
                 case "CONCAT":
                 case "CONCATENATE":
                 {
                     var sb = new StringBuilder();
-                    foreach (var a in args) sb.Append(ToStr(a.Evaluate(resolver)));
+                    foreach (var a in args) sb.Append(ToStr(a.Evaluate(in ctx)));
                     return sb.ToString();
                 }
                 case "REPT":
                 {
                     RequireArgs(name, args, 2, 2);
-                    string text = ToStr(args[0].Evaluate(resolver));
-                    int times = ToInt(args[1].Evaluate(resolver));
+                    string text = ToStr(args[0].Evaluate(in ctx));
+                    int times = ToInt(args[1].Evaluate(in ctx));
                     if (times < 0) throw new FormulaException("#VALUE! (REPT count < 0)");
                     if (times == 0 || string.IsNullOrEmpty(text)) return string.Empty;
                     var sb = new StringBuilder(text.Length * Math.Min(times, 1024));
@@ -890,16 +1203,16 @@ namespace RevitLocationExporter.Core
                 {
                     RequireArgs(name, args, 2, 2);
                     return string.Equals(
-                        ToStr(args[0].Evaluate(resolver)),
-                        ToStr(args[1].Evaluate(resolver)),
+                        ToStr(args[0].Evaluate(in ctx)),
+                        ToStr(args[1].Evaluate(in ctx)),
                         StringComparison.Ordinal);
                 }
                 case "SPLIT":
                 {
                     RequireArgs(name, args, 3, 3);
-                    string text = ToStr(args[0].Evaluate(resolver));
-                    string delim = ToStr(args[1].Evaluate(resolver));
-                    int index = ToInt(args[2].Evaluate(resolver));
+                    string text = ToStr(args[0].Evaluate(in ctx));
+                    string delim = ToStr(args[1].Evaluate(in ctx));
+                    int index = ToInt(args[2].Evaluate(in ctx));
                     if (string.IsNullOrEmpty(delim) || index == 0)
                         throw new FormulaException("#VALUE! (SPLIT invalid delimiter or 0 index)");
 
@@ -909,25 +1222,73 @@ namespace RevitLocationExporter.Core
                         throw new FormulaException($"#VALUE! (SPLIT index {index} out of bounds)");
                     return parts[idx0];
                 }
+                case "PADLEFT":
+                {
+                    RequireArgs(name, args, 2, 3);
+                    string text = ToStr(args[0].Evaluate(in ctx));
+                    int width = ToInt(args[1].Evaluate(in ctx));
+                    if (width < 0) throw new FormulaException("#VALUE! (PADLEFT width < 0)");
+                    string padStr = args.Count >= 3 ? ToStr(args[2].Evaluate(in ctx)) : " ";
+                    char padChar = string.IsNullOrEmpty(padStr) ? ' ' : padStr[0];
+                    return text.PadLeft(width, padChar);
+                }
+                case "PADRIGHT":
+                {
+                    RequireArgs(name, args, 2, 3);
+                    string text = ToStr(args[0].Evaluate(in ctx));
+                    int width = ToInt(args[1].Evaluate(in ctx));
+                    if (width < 0) throw new FormulaException("#VALUE! (PADRIGHT width < 0)");
+                    string padStr = args.Count >= 3 ? ToStr(args[2].Evaluate(in ctx)) : " ";
+                    char padChar = string.IsNullOrEmpty(padStr) ? ' ' : padStr[0];
+                    return text.PadRight(width, padChar);
+                }
+                case "REGEXEXTRACT":
+                {
+                    RequireArgs(name, args, 2, 3);
+                    string text = ToStr(args[0].Evaluate(in ctx));
+                    string pattern = ToStr(args[1].Evaluate(in ctx));
+                    int group = args.Count >= 3 ? ToInt(args[2].Evaluate(in ctx)) : 0;
+                    if (group < 0) throw new FormulaException("#VALUE! (REGEXEXTRACT group < 0)");
+                    var rx = GetCachedRegex(pattern);
+                    var m = rx.Match(text);
+                    if (!m.Success || group >= m.Groups.Count || !m.Groups[group].Success)
+                        return string.Empty;
+                    return m.Groups[group].Value;
+                }
+                case "REGEXREPLACE":
+                {
+                    RequireArgs(name, args, 3, 3);
+                    string text = ToStr(args[0].Evaluate(in ctx));
+                    string pattern = ToStr(args[1].Evaluate(in ctx));
+                    string replacement = ToStr(args[2].Evaluate(in ctx));
+                    return GetCachedRegex(pattern).Replace(text, replacement);
+                }
+                case "REGEXMATCH":
+                {
+                    RequireArgs(name, args, 2, 2);
+                    string text = ToStr(args[0].Evaluate(in ctx));
+                    string pattern = ToStr(args[1].Evaluate(in ctx));
+                    return GetCachedRegex(pattern).IsMatch(text);
+                }
                 case "CONTAINS":
                 {
                     RequireArgs(name, args, 2, 2);
-                    string text = ToStr(args[0].Evaluate(resolver));
-                    string sub = ToStr(args[1].Evaluate(resolver));
+                    string text = ToStr(args[0].Evaluate(in ctx));
+                    string sub = ToStr(args[1].Evaluate(in ctx));
                     return text.IndexOf(sub, StringComparison.OrdinalIgnoreCase) >= 0;
                 }
                 case "STARTSWITH":
                 {
                     RequireArgs(name, args, 2, 2);
-                    string text = ToStr(args[0].Evaluate(resolver));
-                    string prefix = ToStr(args[1].Evaluate(resolver));
+                    string text = ToStr(args[0].Evaluate(in ctx));
+                    string prefix = ToStr(args[1].Evaluate(in ctx));
                     return text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
                 }
                 case "ENDSWITH":
                 {
                     RequireArgs(name, args, 2, 2);
-                    string text = ToStr(args[0].Evaluate(resolver));
-                    string suffix = ToStr(args[1].Evaluate(resolver));
+                    string text = ToStr(args[0].Evaluate(in ctx));
+                    string suffix = ToStr(args[1].Evaluate(in ctx));
                     return text.EndsWith(suffix, StringComparison.OrdinalIgnoreCase);
                 }
 
@@ -935,13 +1296,13 @@ namespace RevitLocationExporter.Core
                 case "VALUE":
                 {
                     RequireArgs(name, args, 1, 1);
-                    return ToNumber(args[0].Evaluate(resolver));
+                    return ToNumber(args[0].Evaluate(in ctx));
                 }
                 case "TEXT":
                 {
                     RequireArgs(name, args, 2, 2);
-                    object raw = args[0].Evaluate(resolver);
-                    string fmt = ToStr(args[1].Evaluate(resolver));
+                    object raw = args[0].Evaluate(in ctx);
+                    string fmt = ToStr(args[1].Evaluate(in ctx));
                     if (TryParseNumber(raw, out double num))
                         return num.ToString(fmt, CultureInfo.InvariantCulture);
                     if (DateTime.TryParse(ToStr(raw), CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime dt))
@@ -951,8 +1312,8 @@ namespace RevitLocationExporter.Core
                 case "ROUND":
                 {
                     RequireArgs(name, args, 2, 2);
-                    double val = ToNumber(args[0].Evaluate(resolver));
-                    int digits = ToInt(args[1].Evaluate(resolver));
+                    double val = ToNumber(args[0].Evaluate(in ctx));
+                    int digits = ToInt(args[1].Evaluate(in ctx));
                     if (digits >= 0) return Math.Round(val, digits, MidpointRounding.AwayFromZero);
                     double factor = Math.Pow(10, -digits);
                     return Math.Round(val / factor, 0, MidpointRounding.AwayFromZero) * factor;
@@ -960,25 +1321,25 @@ namespace RevitLocationExporter.Core
                 case "ABS":
                 {
                     RequireArgs(name, args, 1, 1);
-                    return Math.Abs(ToNumber(args[0].Evaluate(resolver)));
+                    return Math.Abs(ToNumber(args[0].Evaluate(in ctx)));
                 }
                 case "INT":
                 {
                     RequireArgs(name, args, 1, 1);
-                    return Math.Floor(ToNumber(args[0].Evaluate(resolver)));
+                    return Math.Floor(ToNumber(args[0].Evaluate(in ctx)));
                 }
                 case "MIN":
                 {
                     RequireArgs(name, args, 1, 64);
                     double m = double.PositiveInfinity;
-                    foreach (var a in args) m = Math.Min(m, ToNumber(a.Evaluate(resolver)));
+                    foreach (var a in args) m = Math.Min(m, ToNumber(a.Evaluate(in ctx)));
                     return m;
                 }
                 case "MAX":
                 {
                     RequireArgs(name, args, 1, 64);
                     double m = double.NegativeInfinity;
-                    foreach (var a in args) m = Math.Max(m, ToNumber(a.Evaluate(resolver)));
+                    foreach (var a in args) m = Math.Max(m, ToNumber(a.Evaluate(in ctx)));
                     return m;
                 }
 

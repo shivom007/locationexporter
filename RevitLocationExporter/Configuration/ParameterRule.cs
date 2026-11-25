@@ -10,17 +10,24 @@ namespace RevitLocationExporter.Configuration
     public enum ParameterRuleTarget
     {
         Element,
+        ElementInstance,
+        ElementType,
+        ElementBoth,
         Sheet,
         Titleblock,
         SheetCover,
         ProjectInfo
     }
 
-    /// <summary>Controls whether a ParameterRule overwrites existing values or only fills empty ones.</summary>
+    /// <summary>Controls how a ParameterRule writes values to Revit parameters.</summary>
     public enum ParameterFillMode
     {
         Overwrite,
-        FillIfEmpty
+        FillIfEmpty,
+        SkipIfBlankResult,
+        Append,
+        Prepend,
+        Clear
     }
 
     /// <summary>View search scope for sheet TextNote replacement rules.</summary>
@@ -79,6 +86,7 @@ namespace RevitLocationExporter.Configuration
         public bool Enabled { get; set; } = true;
         public ParameterRuleTarget Target { get; set; } = ParameterRuleTarget.Element;
         public string Filter { get; set; } = "*";
+        public string Condition { get; set; } = string.Empty;
         public string ParameterName { get; set; } = string.Empty;
         public string ValueOrFormula { get; set; } = string.Empty;
         public ParameterFillMode Mode { get; set; } = ParameterFillMode.Overwrite;
@@ -89,6 +97,9 @@ namespace RevitLocationExporter.Configuration
             !string.IsNullOrWhiteSpace(ValueOrFormula) &&
             ValueOrFormula.TrimStart().StartsWith("=", StringComparison.Ordinal);
 
+        [JsonIgnore]
+        public bool HasCondition => !string.IsNullOrWhiteSpace(Condition);
+
         public ParameterRule Clone()
         {
             return new ParameterRule
@@ -96,6 +107,7 @@ namespace RevitLocationExporter.Configuration
                 Enabled = this.Enabled,
                 Target = this.Target,
                 Filter = this.Filter,
+                Condition = this.Condition,
                 ParameterName = this.ParameterName,
                 ValueOrFormula = this.ValueOrFormula,
                 Mode = this.Mode,
@@ -161,6 +173,10 @@ namespace RevitLocationExporter.Configuration
 
         public List<StandardsFillRowDto> StandardsFillRows { get; set; } = new();
 
+        /// <summary>Generic row tables for every synced Excel worksheet (enables XLOOKUP formulas).</summary>
+        public Dictionary<string, List<Dictionary<string, string>>> LookupTables { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
         public void EnsureCaseInsensitive()
         {
             ElementParameters = NormalizeNested(ElementParameters);
@@ -170,6 +186,7 @@ namespace RevitLocationExporter.Configuration
                 ? new Dictionary<string, string>(ExportLocations, StringComparer.OrdinalIgnoreCase)
                 : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             StandardsFillRows ??= new List<StandardsFillRowDto>();
+            LookupTables = NormalizeLookupTables(LookupTables);
         }
 
         private static Dictionary<string, Dictionary<string, string>> NormalizeNested(
@@ -186,6 +203,28 @@ namespace RevitLocationExporter.Configuration
             return dst;
         }
 
+        private static Dictionary<string, List<Dictionary<string, string>>> NormalizeLookupTables(
+            Dictionary<string, List<Dictionary<string, string>>>? src)
+        {
+            var dst = new Dictionary<string, List<Dictionary<string, string>>>(StringComparer.OrdinalIgnoreCase);
+            if (src == null) return dst;
+            foreach (var kv in src)
+            {
+                var list = new List<Dictionary<string, string>>();
+                if (kv.Value != null)
+                {
+                    foreach (var row in kv.Value)
+                    {
+                        list.Add(row != null
+                            ? new Dictionary<string, string>(row, StringComparer.OrdinalIgnoreCase)
+                            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+                    }
+                }
+                dst[kv.Key] = list;
+            }
+            return dst;
+        }
+
         public SyncedExcelSnapshot Clone()
         {
             return new SyncedExcelSnapshot
@@ -198,7 +237,8 @@ namespace RevitLocationExporter.Configuration
                     StringComparer.OrdinalIgnoreCase),
                 StandardsFillRows = (StandardsFillRows ?? new List<StandardsFillRowDto>())
                     .Select(r => r.Clone())
-                    .ToList()
+                    .ToList(),
+                LookupTables = NormalizeLookupTables(LookupTables)
             };
         }
 
@@ -217,7 +257,8 @@ namespace RevitLocationExporter.Configuration
                 SheetParameters = NormalizeNested(SheetParameters),
                 SheetNumberParameters = NormalizeNested(SheetNumberParameters),
                 ExportLocations = new Dictionary<string, string>(ExportLocations, StringComparer.OrdinalIgnoreCase),
-                StandardsFillRows = StandardsFillRows.Select(r => r.ToCoreRow()).ToList()
+                StandardsFillRows = StandardsFillRows.Select(r => r.ToCoreRow()).ToList(),
+                LookupTables = NormalizeLookupTables(LookupTables)
             };
         }
 
@@ -231,7 +272,8 @@ namespace RevitLocationExporter.Configuration
                 ExportLocations = new Dictionary<string, string>(bundle.ExportLocations, StringComparer.OrdinalIgnoreCase),
                 StandardsFillRows = (bundle.StandardsFillRows ?? new List<StandardsFillRow>())
                     .Select(StandardsFillRowDto.FromCoreRow)
-                    .ToList()
+                    .ToList(),
+                LookupTables = NormalizeLookupTables(bundle.LookupTables)
             };
             return snap;
         }

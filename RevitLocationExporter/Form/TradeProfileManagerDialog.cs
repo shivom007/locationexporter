@@ -661,14 +661,14 @@ namespace RevitLocationExporter.Form
             _dgRules.Columns.Add(new DataGridComboBoxColumn
             {
                 Header = "Target",
-                Width = 100,
+                Width = 115,
                 ItemsSource = Enum.GetValues(typeof(ParameterRuleTarget)),
                 SelectedItemBinding = new WpfBinding("Target") { UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }
             });
             _dgRules.Columns.Add(new DataGridTextColumn
             {
                 Header = "Filter",
-                Width = 115,
+                Width = 105,
                 Binding = new WpfBinding("Filter") { UpdateSourceTrigger = UpdateSourceTrigger.LostFocus }
             });
 
@@ -678,8 +678,16 @@ namespace RevitLocationExporter.Form
 
             _dgRules.Columns.Add(new DataGridTextColumn
             {
+                Header = "Condition",
+                Width = 140,
+                ElementStyle = paramColStyle,
+                Binding = new WpfBinding("Condition") { UpdateSourceTrigger = UpdateSourceTrigger.LostFocus }
+            });
+
+            _dgRules.Columns.Add(new DataGridTextColumn
+            {
                 Header = "Parameter",
-                Width = 155,
+                Width = 145,
                 ElementStyle = paramColStyle,
                 Binding = new WpfBinding("ParameterName") { UpdateSourceTrigger = UpdateSourceTrigger.LostFocus }
             });
@@ -698,7 +706,7 @@ namespace RevitLocationExporter.Form
             _dgRules.Columns.Add(new DataGridComboBoxColumn
             {
                 Header = "Mode",
-                Width = 100,
+                Width = 115,
                 ItemsSource = Enum.GetValues(typeof(ParameterFillMode)),
                 SelectedItemBinding = new WpfBinding("Mode") { UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }
             });
@@ -1629,6 +1637,8 @@ namespace RevitLocationExporter.Form
             string code = string.IsNullOrWhiteSpace(_tbTradeCode.Text) ? "TI0" : _tbTradeCode.Text.Trim().ToUpperInvariant();
             string name = _tbTradeName.Text?.Trim() ?? "Trade";
 
+            string today = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+
             sampleMap["Location"] = locSample;
             sampleMap["Locator Code"] = locSample;
             sampleMap["LocatorCode"] = locSample;
@@ -1636,6 +1646,12 @@ namespace RevitLocationExporter.Form
             sampleMap["TradeName"] = name;
             sampleMap["ProjectNumber"] = proj;
             sampleMap["Originator"] = orig;
+            sampleMap["Today"] = today;
+            sampleMap["Date"] = today;
+            sampleMap["UserName"] = Environment.UserName;
+            sampleMap["SystemCode"] = code;
+            sampleMap["Level"] = "GF";
+            sampleMap["Workset"] = $"{locSample}_{code}_FA";
             sampleMap["RvtFileName"] = (_tbRvtTemplate.Text ?? "")
                 .Replace("{ProjectNumber}", proj).Replace("{Originator}", orig)
                 .Replace("{TradeCode}", code).Replace("{Location}", locSample);
@@ -1655,11 +1671,20 @@ namespace RevitLocationExporter.Form
                 if (!string.IsNullOrEmpty(k)) sampleMap[k] = v;
             }
 
+            ExcelFormulaEngine.TableLookupFunc? tableLookup = null;
+            if (!string.IsNullOrWhiteSpace(_currentTradeCode) &&
+                _workingProfiles.TryGetValue(_currentTradeCode!, out var currentProfile) &&
+                currentProfile.SyncedData?.LookupTables is { Count: > 0 } lookupTables)
+            {
+                tableLookup = ExcelFormulaEngine.CreateTableLookup(lookupTables);
+            }
+
             var rules = _ruleRows.Select(r => r.ToRule()).ToList();
-            var evaluated = ExcelFormulaEngine.EvaluateRulesOrdered(
-                rules,
+            var compiled = ExcelFormulaEngine.CompileRules(rules);
+            var evaluated = compiled.EvaluateOrdered(
                 k => sampleMap.TryGetValue(k, out var val) ? val : null,
-                out var warnings);
+                out var warnings,
+                tableLookup);
 
             int errCount = 0;
             for (int i = 0; i < _ruleRows.Count && i < evaluated.Count; i++)
@@ -1674,6 +1699,10 @@ namespace RevitLocationExporter.Form
                 {
                     vm.SetPreview($"ERR: {res.Error}", true, false);
                     errCount++;
+                }
+                else if (!res.ConditionMet)
+                {
+                    vm.SetPreview("(condition false)", false, true);
                 }
                 else
                 {
@@ -1701,27 +1730,30 @@ namespace RevitLocationExporter.Form
         private void ShowFormulaSyntaxDialog()
         {
             const string help =
-                "PREFIX:\n" +
-                "  Start any Value / Formula with '=' to evaluate as a formula.\n" +
-                "  Without '=', the text is treated as a literal value.\n\n" +
-                "REFERENCES:\n" +
-                "  Wrap parameter names, Excel columns, or built-in tokens in brackets:\n" +
-                "    [CPK_WBS_5], [para1], [Location], [TradeCode], [ProjectNumber],\n" +
-                "    [Originator], [RvtFileName], [Sheet Number], [Level], [Category]\n\n" +
+                "PREFIX & CONDITIONS:\n" +
+                "  Start any Value / Formula or Condition with '=' to evaluate as a formula.\n" +
+                "  Optional Condition column skips the rule whenever it evaluates to FALSE.\n\n" +
+                "BUILT-IN TOKENS:\n" +
+                "  Global:  [Location], [TradeCode], [TradeName], [ProjectNumber], [Originator],\n" +
+                "           [RvtFileName], [IfcFileName], [NwcFileName], [Today], [UserName]\n" +
+                "  Element: [Category], [Family], [Type], [Level], [Workset], [PhaseCreated],\n" +
+                "           [ElementId], [RoomName], [RoomNumber], [SpaceName], [ModelTitle]\n" +
+                "  Sheet:   [Sheet Number], [Sheet Name], [WorkPackage], [SystemCode],\n" +
+                "           [LevelCode], [DrawingSeq], [CurrentRevision], [CurrentRevisionDate]\n\n" +
                 "EXAMPLES:\n" +
                 "  • Last 2 chars with dot (81 → 8.1):\n" +
                 "      =LEFT(RIGHT([CPK_WBS_5],2),1)&\".\"&RIGHT([CPK_WBS_5],1)\n" +
-                "  • Insert dot before last 2 chars:\n" +
-                "      =LEFT([CPK_WBS_5],LEN([CPK_WBS_5])-2)&\".\"&RIGHT([CPK_WBS_5],2)\n" +
-                "  • Extract first token before dot in uppercase:\n" +
-                "      =UPPER(LEFT([para1],FIND(\".\",[para1])-1))\n" +
-                "  • Conditional check:\n" +
-                "      =IF(CONTAINS([Category],\"Tray\"),[Location]&\"_CT\",[Location])\n\n" +
+                "  • Conditional check (in Condition column):\n" +
+                "      =AND(CONTAINS([Workset],\"_TI0_FA\"), [Level]=\"GF\")\n" +
+                "  • Lookup across any Excel tab:\n" +
+                "      =XLOOKUP([SystemCode], \"System_Lookup\", \"Code\", \"SystemName\", \"Other\")\n\n" +
                 "SUPPORTED FUNCTIONS:\n" +
-                "  Text:    LEFT, RIGHT, MID, LEN, FIND, SEARCH, SUBSTITUTE, REPLACE,\n" +
-                "           UPPER, LOWER, PROPER, TRIM, CONCAT, CONCATENATE, REPT, EXACT, SPLIT\n" +
-                "  Logic:   IF, IFERROR, ISBLANK, AND, OR, NOT, CONTAINS, STARTSWITH, ENDSWITH\n" +
-                "  Numeric: VALUE, TEXT, ROUND, ABS, INT, MIN, MAX\n" +
+                "  Text:    LEFT, RIGHT, MID, LEN, FIND, SEARCH, SUBSTITUTE, REPLACE, PADLEFT,\n" +
+                "           PADRIGHT, UPPER, LOWER, PROPER, TRIM, CONCAT, REPT, EXACT, SPLIT\n" +
+                "  Regex:   REGEXEXTRACT, REGEXREPLACE, REGEXMATCH\n" +
+                "  Logic:   IF, IFERROR, COALESCE, ISBLANK, AND, OR, NOT, CONTAINS, STARTSWITH, ENDSWITH\n" +
+                "  Lookup:  XLOOKUP(lookupVal, \"SheetName\", \"KeyCol\", \"ReturnCol\", [fallback])\n" +
+                "  Numeric: VALUE, TEXT, ROUND, ABS, INT, MIN, MAX (also supports '2500 mm' on Double writes)\n" +
                 "  Ops:     &, +, -, *, /, =, <>, !=, <, >, <=, >=";
 
             WpfMessageBox.Show(this, help, "Excel Formula Syntax Reference", MessageBoxButton.OK, MessageBoxImage.Information);
@@ -2106,6 +2138,7 @@ namespace RevitLocationExporter.Form
             private bool _enabled = true;
             private ParameterRuleTarget _target = ParameterRuleTarget.Element;
             private string _filter = "*";
+            private string _condition = string.Empty;
             private string _parameterName = string.Empty;
             private string _valueOrFormula = string.Empty;
             private ParameterFillMode _mode = ParameterFillMode.Overwrite;
@@ -2129,6 +2162,12 @@ namespace RevitLocationExporter.Form
             {
                 get => _filter;
                 set { _filter = value ?? "*"; OnPropertyChanged(nameof(Filter)); }
+            }
+
+            public string Condition
+            {
+                get => _condition;
+                set { _condition = value ?? string.Empty; OnPropertyChanged(nameof(Condition)); }
             }
 
             public string ParameterName
@@ -2175,6 +2214,7 @@ namespace RevitLocationExporter.Form
                 Enabled = Enabled,
                 Target = Target,
                 Filter = string.IsNullOrWhiteSpace(Filter) ? "*" : Filter.Trim(),
+                Condition = Condition ?? string.Empty,
                 ParameterName = (ParameterName ?? string.Empty).Trim(),
                 ValueOrFormula = ValueOrFormula ?? string.Empty,
                 Mode = Mode,
@@ -2186,6 +2226,7 @@ namespace RevitLocationExporter.Form
                 Enabled = r.Enabled,
                 Target = r.Target,
                 Filter = string.IsNullOrWhiteSpace(r.Filter) ? "*" : r.Filter,
+                Condition = r.Condition ?? string.Empty,
                 ParameterName = r.ParameterName,
                 ValueOrFormula = r.ValueOrFormula,
                 Mode = r.Mode,
