@@ -1766,8 +1766,16 @@ namespace RevitLocationExporter.Commands
 
                     if (locContexts.Count == 0) continue;
 
-                    // Compute WorksetConfiguration ONCE per source file
-                    using OpenOptions openOpts = BuildOpenOptions(rvtPath, worksetOptions, trade, log);
+                    // Resolve WorksetId plan ONCE per source file (no repeated disk inspection per location)
+                    var srcWsPlan = ResolveWorksetsToOpen(rvtPath, worksetOptions, trade, log, logInfo: true);
+
+                    bool hasVaryingSheetSpecific = paramBundle != null && paramBundle.SheetNumberParameters.Count > 0;
+                    bool needsIsolatedState =
+                        trade.TextNoteRules.Any(r => r.Enabled) ||
+                        trade.ParameterRules.Any(r => r.Enabled && (r.Mode != ParameterFillMode.Overwrite || r.HasCondition)) ||
+                        options.EnforceModelStandards ||
+                        hasVaryingSheetSpecific;
+                    bool isNetworkPath = filePath.StartsWith(@"\\", StringComparison.Ordinal);
 
                     if (locContexts.Count == 1)
                     {
@@ -1775,14 +1783,16 @@ namespace RevitLocationExporter.Commands
                         var ctx = locContexts[0];
                         try
                         {
+                            using OpenOptions openOpts = CreateOpenOptionsFromCache(detachWorkshared: true, srcWsPlan);
                             using Document doc = app.OpenDocumentFile(rvtPath, openOpts);
                             try
                             {
+                                var sw = System.Diagnostics.Stopwatch.StartNew();
                                 RunLocationStepsOnOpenDoc(doc, rvtPath, nativeModelLocator, ctx.Name, ctx.ElemParams, ctx.SheetParams,
                                     paramBundle, ctx.ExportRoot, log, updater, trade, settings, options,
                                     effProjNum, effOrig, ctx.Tokens, tableLookup, alreadyPreCleaned: false);
                                 doc.Close(false);
-                                log.Info(ctx.Name, "All requested steps completed.");
+                                log.Info(ctx.Name, $"All requested steps completed ({sw.Elapsed.TotalSeconds:F1}s).");
                             }
                             catch
                             {
@@ -1795,14 +1805,61 @@ namespace RevitLocationExporter.Commands
                             log.Error(ctx.Name, $"[{fileName}] {ex.Message}");
                         }
                     }
+                    else if (!options.SaveCentralRvt && !needsIsolatedState)
+                    {
+                        // Single-Open Sequential In-Place Mode (SaveCentralRvt OFF, state is idempotent/overwrite):
+                        // Open model ONCE, pre-clean ONCE, then process all locations sequentially outside any TransactionGroup
+                        // (NWC export works natively outside TransactionGroup, 0 re-opens, 0 staging saves).
+                        log.Info(fileName, $"Single-Open In-Place mode: opening '{fileName}' once for {locContexts.Count} location(s) (0 re-opens, 0 staging saves).");
+                        try
+                        {
+                            using OpenOptions openOpts = CreateOpenOptionsFromCache(detachWorkshared: true, srcWsPlan);
+                            using Document doc = app.OpenDocumentFile(rvtPath, openOpts);
+                            try
+                            {
+                                PreCleanDocument(doc, nativeModelLocator, log, trade, options);
+                                string currentSheetLocator = nativeModelLocator;
+
+                                foreach (var ctx in locContexts)
+                                {
+                                    try
+                                    {
+                                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                                        RunLocationStepsOnOpenDoc(doc, rvtPath, currentSheetLocator, ctx.Name, ctx.ElemParams, ctx.SheetParams,
+                                            paramBundle, ctx.ExportRoot, log, updater, trade, settings, options,
+                                            effProjNum, effOrig, ctx.Tokens, tableLookup, alreadyPreCleaned: true,
+                                            out string nextSheetLocator, originalNativeLocator: nativeModelLocator);
+                                        if (!string.IsNullOrEmpty(nextSheetLocator))
+                                            currentSheetLocator = nextSheetLocator;
+                                        log.Info(ctx.Name, $"All requested steps completed ({sw.Elapsed.TotalSeconds:F1}s).");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        log.Error(ctx.Name, $"[{fileName}] {ex.Message}");
+                                    }
+                                }
+
+                                doc.Close(false);
+                            }
+                            catch
+                            {
+                                try { doc.Close(false); } catch { }
+                                throw;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            log.Error(fileName, $"Failed single-open batch for '{fileName}': {ex.Message}");
+                        }
+                    }
                     else if (!options.SaveCentralRvt && !options.ExportNwc)
                     {
-                        // Hybrid Fast Path (2+ locations, SaveCentralRvt OFF and ExportNwc OFF):
+                        // Hybrid In-Memory Mode (2+ locations, SaveCentralRvt OFF, ExportNwc OFF, needs per-location state isolation):
                         // Open heavy model ONCE, commit one-time pre-clean baseline, then isolate each location via TransactionGroup.RollBack().
-                        // NWC export (NavisworksExportOptions) must run outside any active TransactionGroup, so multi-location NWC runs route to Hybrid Staged Path.
                         log.Info(fileName, $"Hybrid In-Memory mode: opening once for {locContexts.Count} location(s) (zero re-opens).");
                         try
                         {
+                            using OpenOptions openOpts = CreateOpenOptionsFromCache(detachWorkshared: true, srcWsPlan);
                             using Document doc = app.OpenDocumentFile(rvtPath, openOpts);
                             try
                             {
@@ -1814,10 +1871,11 @@ namespace RevitLocationExporter.Commands
                                     tg.Start();
                                     try
                                     {
+                                        var sw = System.Diagnostics.Stopwatch.StartNew();
                                         RunLocationStepsOnOpenDoc(doc, rvtPath, nativeModelLocator, ctx.Name, ctx.ElemParams, ctx.SheetParams,
                                             paramBundle, ctx.ExportRoot, log, updater, trade, settings, options,
                                             effProjNum, effOrig, ctx.Tokens, tableLookup, alreadyPreCleaned: true);
-                                        log.Info(ctx.Name, "All requested steps completed.");
+                                        log.Info(ctx.Name, $"All requested steps completed ({sw.Elapsed.TotalSeconds:F1}s).");
                                     }
                                     catch (Exception ex)
                                     {
@@ -1844,61 +1902,111 @@ namespace RevitLocationExporter.Commands
                     }
                     else
                     {
-                        // Hybrid Staged Path (2+ locations, SaveCentralRvt ON or ExportNwc ON):
-                        // Open heavy model ONCE -> pre-clean & compact to fast local SSD temp copy -> extract each location cleanly outside TransactionGroup
-                        string tempStageDir = Path.Combine(Path.GetTempPath(), $"RevitLocStage_{Guid.NewGuid():N}");
-                        Directory.CreateDirectory(tempStageDir);
-                        string stagedPath = Path.Combine(tempStageDir, fileName);
-                        ModelPath stagedModelPath;
-                        bool stagedIsWorkshared = false;
+                        bool shouldStage =
+                            isNetworkPath ||
+                            (locContexts.Count >= 4 && options.PurgeUnused) ||
+                            (!options.SaveCentralRvt && needsIsolatedState && options.ExportNwc);
 
-                        log.Info(fileName, $"Hybrid Staged mode: pre-cleaning and compacting '{fileName}' once for {locContexts.Count} location export(s).");
-                        try
+                        if (shouldStage)
                         {
-                            using (Document srcDoc = app.OpenDocumentFile(rvtPath, openOpts))
+                            // Fast Staged Mode (Compact = false, never re-compress OLE streams):
+                            // Open source model ONCE -> pre-clean ONCE -> SaveAs to local SSD temp -> extract each location outside TransactionGroup.
+                            string tempStageDir = Path.Combine(Path.GetTempPath(), $"RevitLocStage_{Guid.NewGuid():N}");
+                            Directory.CreateDirectory(tempStageDir);
+                            string stagedPath = Path.Combine(tempStageDir, fileName);
+                            ModelPath stagedModelPath;
+                            bool stagedIsWorkshared = false;
+
+                            log.Info(fileName, $"Fast Staged mode: pre-cleaning '{fileName}' once (Compact=false) for {locContexts.Count} location export(s).");
+                            try
                             {
-                                try
+                                using (OpenOptions srcOpenOpts = CreateOpenOptionsFromCache(detachWorkshared: true, srcWsPlan))
+                                using (Document srcDoc = app.OpenDocumentFile(rvtPath, srcOpenOpts))
                                 {
-                                    PreCleanDocument(srcDoc, nativeModelLocator, log, trade, options);
-
-                                    stagedIsWorkshared = srcDoc.IsWorkshared;
-                                    var stageSaveOpts = new SaveAsOptions
-                                    {
-                                        OverwriteExistingFile = true,
-                                        Compact = true
-                                    };
-                                    if (stagedIsWorkshared)
-                                    {
-                                        stageSaveOpts.SetWorksharingOptions(new WorksharingSaveAsOptions { SaveAsCentral = true });
-                                    }
-                                    srcDoc.SaveAs(stagedPath, stageSaveOpts);
-                                    srcDoc.Close(false);
-                                }
-                                catch
-                                {
-                                    try { srcDoc.Close(false); } catch { }
-                                    throw;
-                                }
-                            }
-
-                            stagedModelPath = ModelPathUtils.ConvertUserVisiblePathToModelPath(stagedPath);
-
-                            for (int locIdx = 0; locIdx < locContexts.Count; locIdx++)
-                            {
-                                var ctx = locContexts[locIdx];
-                                try
-                                {
-                                    using OpenOptions locOpenOpts = stagedIsWorkshared
-                                        ? BuildOpenOptions(stagedModelPath, worksetOptions, trade, log, quiet: locIdx > 0)
-                                        : new OpenOptions { Audit = false };
-                                    using Document doc = app.OpenDocumentFile(stagedModelPath, locOpenOpts);
                                     try
                                     {
-                                        RunLocationStepsOnOpenDoc(doc, stagedModelPath, nativeModelLocator, ctx.Name, ctx.ElemParams, ctx.SheetParams,
+                                        PreCleanDocument(srcDoc, nativeModelLocator, log, trade, options);
+
+                                        stagedIsWorkshared = srcDoc.IsWorkshared;
+                                        var stageSaveOpts = new SaveAsOptions
+                                        {
+                                            OverwriteExistingFile = true,
+                                            Compact = false
+                                        };
+                                        if (stagedIsWorkshared)
+                                        {
+                                            stageSaveOpts.SetWorksharingOptions(new WorksharingSaveAsOptions { SaveAsCentral = true });
+                                        }
+                                        srcDoc.SaveAs(stagedPath, stageSaveOpts);
+                                        srcDoc.Close(false);
+                                    }
+                                    catch
+                                    {
+                                        try { srcDoc.Close(false); } catch { }
+                                        throw;
+                                    }
+                                }
+
+                                stagedModelPath = ModelPathUtils.ConvertUserVisiblePathToModelPath(stagedPath);
+                                var stagedWsPlan = stagedIsWorkshared
+                                    ? ResolveWorksetsToOpen(stagedModelPath, worksetOptions, trade, log, logInfo: false)
+                                    : (HasUserWorksets: false, OpenIds: new List<WorksetId>());
+
+                                foreach (var ctx in locContexts)
+                                {
+                                    try
+                                    {
+                                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                                        using OpenOptions locOpenOpts = CreateOpenOptionsFromCache(stagedIsWorkshared, stagedWsPlan);
+                                        using Document doc = app.OpenDocumentFile(stagedModelPath, locOpenOpts);
+                                        try
+                                        {
+                                            RunLocationStepsOnOpenDoc(doc, stagedModelPath, nativeModelLocator, ctx.Name, ctx.ElemParams, ctx.SheetParams,
+                                                paramBundle, ctx.ExportRoot, log, updater, trade, settings, options,
+                                                effProjNum, effOrig, ctx.Tokens, tableLookup, alreadyPreCleaned: true);
+                                            doc.Close(false);
+                                            log.Info(ctx.Name, $"All requested steps completed ({sw.Elapsed.TotalSeconds:F1}s).");
+                                        }
+                                        catch
+                                        {
+                                            try { doc.Close(false); } catch { }
+                                            throw;
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        log.Error(ctx.Name, $"[{fileName}] {ex.Message}");
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                log.Error(fileName, $"Failed staged extraction for '{fileName}': {ex.Message}");
+                            }
+                            finally
+                            {
+                                try { if (Directory.Exists(tempStageDir)) Directory.Delete(tempStageDir, true); } catch { }
+                            }
+                        }
+                        else
+                        {
+                            // Fast Direct Mode (SaveCentralRvt ON on local disk for 2-3 locations or PurgeUnused OFF):
+                            // Direct detached opens using cached WorksetIds (no extra open, no extra staging SaveAs).
+                            log.Info(fileName, $"Direct mode: processing {locContexts.Count} location(s) directly from '{fileName}' (no staging overhead).");
+                            foreach (var ctx in locContexts)
+                            {
+                                try
+                                {
+                                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                                    using OpenOptions locOpenOpts = CreateOpenOptionsFromCache(detachWorkshared: true, srcWsPlan);
+                                    using Document doc = app.OpenDocumentFile(rvtPath, locOpenOpts);
+                                    try
+                                    {
+                                        RunLocationStepsOnOpenDoc(doc, rvtPath, nativeModelLocator, ctx.Name, ctx.ElemParams, ctx.SheetParams,
                                             paramBundle, ctx.ExportRoot, log, updater, trade, settings, options,
-                                            effProjNum, effOrig, ctx.Tokens, tableLookup, alreadyPreCleaned: true);
+                                            effProjNum, effOrig, ctx.Tokens, tableLookup, alreadyPreCleaned: false);
                                         doc.Close(false);
-                                        log.Info(ctx.Name, "All requested steps completed.");
+                                        log.Info(ctx.Name, $"All requested steps completed ({sw.Elapsed.TotalSeconds:F1}s).");
                                     }
                                     catch
                                     {
@@ -1911,14 +2019,6 @@ namespace RevitLocationExporter.Commands
                                     log.Error(ctx.Name, $"[{fileName}] {ex.Message}");
                                 }
                             }
-                        }
-                        catch (Exception ex)
-                        {
-                            log.Error(fileName, $"Failed staged extraction for '{fileName}': {ex.Message}");
-                        }
-                        finally
-                        {
-                            try { if (Directory.Exists(tempStageDir)) Directory.Delete(tempStageDir, true); } catch { }
                         }
                     }
                 }
@@ -1959,55 +2059,70 @@ namespace RevitLocationExporter.Commands
             };
         }
 
-        private static OpenOptions BuildOpenOptions(
+        private static (bool HasUserWorksets, List<WorksetId> OpenIds) ResolveWorksetsToOpen(
             ModelPath rvtPath,
             WorksetSelectionOptions worksetOptions,
             TradeProfile trade,
             ProcessLog log,
-            bool quiet = false)
+            bool logInfo = true)
         {
-            var opts = new OpenOptions
-            {
-                DetachFromCentralOption = DetachFromCentralOption.DetachAndPreserveWorksets,
-                Audit = false
-            };
+            var openIds = new List<WorksetId>();
+            bool hasUserWorksets = false;
 
             try
             {
                 IList<WorksetPreview> allWorksets = WorksharingUtils.GetUserWorksetInfo(rvtPath);
                 if (allWorksets.Count > 0)
                 {
-                    var wsConfig = new WorksetConfiguration(WorksetConfigurationOption.CloseAllWorksets);
-
+                    hasUserWorksets = true;
                     if (worksetOptions.OpenAllWorksets)
                     {
-                        wsConfig.Open(allWorksets.Select(w => w.Id).ToList());
-                        if (!quiet) log.Info(trade.TradeCode, $"Opened all {allWorksets.Count} worksets.");
+                        openIds.AddRange(allWorksets.Select(w => w.Id));
+                        if (logInfo) log.Info(trade.TradeCode, $"Opened all {allWorksets.Count} worksets.");
                     }
                     else
                     {
-                        var idsToOpen = allWorksets
+                        openIds.AddRange(allWorksets
                             .Where(w => worksetOptions.ShouldOpenWorkset(w.Name, trade))
-                            .Select(w => w.Id)
-                            .ToList();
+                            .Select(w => w.Id));
 
-                        if (idsToOpen.Count > 0)
+                        if (openIds.Count > 0)
                         {
-                            wsConfig.Open(idsToOpen);
-                            if (!quiet) log.Info(trade.TradeCode, $"Opened {idsToOpen.Count} of {allWorksets.Count} worksets (global config).");
+                            if (logInfo) log.Info(trade.TradeCode, $"Opened {openIds.Count} of {allWorksets.Count} worksets (global config).");
                         }
                         else
                         {
                             log.Warning(trade.TradeCode, "No worksets matched global workset configuration — opening model with all user worksets closed.");
                         }
                     }
-
-                    opts.SetOpenWorksetsConfiguration(wsConfig);
                 }
             }
             catch (Exception ex)
             {
                 log.Warning(trade.TradeCode, $"Could not configure worksets before opening: {ex.Message}");
+            }
+
+            return (hasUserWorksets, openIds);
+        }
+
+        private static OpenOptions CreateOpenOptionsFromCache(
+            bool detachWorkshared,
+            (bool HasUserWorksets, List<WorksetId> OpenIds) wsPlan)
+        {
+            var opts = new OpenOptions
+            {
+                DetachFromCentralOption = detachWorkshared
+                    ? DetachFromCentralOption.DetachAndPreserveWorksets
+                    : DetachFromCentralOption.DoNotDetach,
+                Audit = false
+            };
+
+            if (detachWorkshared && wsPlan.HasUserWorksets)
+            {
+                var wsConfig = new WorksetConfiguration(WorksetConfigurationOption.CloseAllWorksets);
+                if (wsPlan.OpenIds.Count > 0)
+                    wsConfig.Open(wsPlan.OpenIds);
+                opts.SetOpenWorksetsConfiguration(wsConfig);
             }
 
             return opts;
@@ -2136,6 +2251,37 @@ namespace RevitLocationExporter.Commands
             ExcelFormulaEngine.TableLookupFunc? tableLookup,
             bool alreadyPreCleaned)
         {
+            RunLocationStepsOnOpenDoc(
+                doc, rvtPath, nativeModelLocator, locationName,
+                elementParams, sheetParams, paramBundle, exportRoot,
+                log, updater, trade, settings, options,
+                effProjNum, effOrig, builtInTokens, tableLookup,
+                alreadyPreCleaned, out _);
+        }
+
+        private static void RunLocationStepsOnOpenDoc(
+            Document doc,
+            ModelPath rvtPath,
+            string nativeModelLocator,
+            string locationName,
+            Dictionary<string, string>? elementParams,
+            Dictionary<string, string>? sheetParams,
+            LocationParameterBundle? paramBundle,
+            string exportRoot,
+            ProcessLog log,
+            ProjectInfoUpdater updater,
+            TradeProfile trade,
+            ProjectSettings settings,
+            ExportExecutionOptions options,
+            string effProjNum,
+            string effOrig,
+            Dictionary<string, string> builtInTokens,
+            ExcelFormulaEngine.TableLookupFunc? tableLookup,
+            bool alreadyPreCleaned,
+            out string updatedSheetLocator,
+            string? originalNativeLocator = null)
+        {
+            updatedSheetLocator = nativeModelLocator;
             SetPinnedStateForReferenceElements(doc, false);
 
             // 1. Coordinates & Workset Renaming
@@ -2161,7 +2307,9 @@ namespace RevitLocationExporter.Commands
                 trade.TextNoteRules.Any(r => r.Enabled)))
             {
                 plSheets = UpdatePlSheets(doc, locationName, sheetParams, elementParams, paramBundle, log, trade,
-                                          builtInTokens, tableLookup, nativeModelLocator, alreadyPreCleaned);
+                                          builtInTokens, tableLookup, nativeModelLocator, alreadyPreCleaned, originalNativeLocator);
+                if (plSheets.Count > 0)
+                    updatedSheetLocator = locationName;
             }
 
             if (options.FillParameters && options.EnforceModelStandards)
@@ -2923,8 +3071,23 @@ namespace RevitLocationExporter.Commands
                     if (!exportViewIds.TryGetValue("NWC", out ElementId nwcViewId) || nwcViewId == ElementId.InvalidElementId)
                         throw new InvalidOperationException($"[{locationName}] NWC export view could not be created — export aborted.");
 
+                    string wsDiag = string.Empty;
+                    int openWsCount = -1;
+                    if (doc.IsWorkshared)
+                    {
+                        try
+                        {
+                            var userWs = new FilteredWorksetCollector(doc)
+                                .OfKind(WorksetKind.UserWorkset)
+                                .ToWorksets();
+                            openWsCount = userWs.Count(w => w.IsOpen);
+                            wsDiag = $" (open user worksets: {openWsCount}/{userWs.Count})";
+                        }
+                        catch { }
+                    }
+
                     View3D? nwcView = doc.GetElement(nwcViewId) as View3D;
-                    bool hasVisibleModelGeometry = new FilteredElementCollector(doc, nwcViewId)
+                    bool hasVisibleModelGeometry = openWsCount != 0 && new FilteredElementCollector(doc, nwcViewId)
                         .WhereElementIsNotElementType()
                         .Any(e => e.Category != null
                             && e.Category.CategoryType == CategoryType.Model
@@ -2933,20 +3096,6 @@ namespace RevitLocationExporter.Commands
 
                     if (!hasVisibleModelGeometry)
                     {
-                        string wsDiag = string.Empty;
-                        if (doc.IsWorkshared)
-                        {
-                            try
-                            {
-                                var userWs = new FilteredWorksetCollector(doc)
-                                    .OfKind(WorksetKind.UserWorkset)
-                                    .ToWorksets();
-                                int openCount = userWs.Count(w => w.IsOpen);
-                                wsDiag = $" (open user worksets: {openCount}/{userWs.Count})";
-                            }
-                            catch { }
-                        }
-
                         log.Warning(locationName,
                             $"NWC export skipped: 3D view '{nwcView?.Name ?? nwcViewId.ToString()}' has no visible host model geometry{wsDiag}. Check workset selection or view visibility.");
                     }
@@ -3006,7 +3155,8 @@ namespace RevitLocationExporter.Commands
             Dictionary<string, string> builtInTokens,
             ExcelFormulaEngine.TableLookupFunc? tableLookup,
             string? nativeModelLocatorOverride = null,
-            bool alreadyPreCleaned = false)
+            bool alreadyPreCleaned = false,
+            string? originalNativeLocator = null)
         {
             string nativeModelLocator = !string.IsNullOrWhiteSpace(nativeModelLocatorOverride)
                 ? nativeModelLocatorOverride!.Trim()
@@ -3096,7 +3246,17 @@ namespace RevitLocationExporter.Commands
                     }
 
                     // 2. Effective parameters = common (Sheet_Params) + per-sheet overrides (Sheet_Specific_Params)
-                    var specific = paramBundle?.GetSheetNumberParams(sheet.SheetNumber, originalNum);
+                    string templateFallbackNum = originalNum;
+                    if (!string.IsNullOrWhiteSpace(originalNativeLocator))
+                    {
+                        string[] origParts = originalNum.Split('-');
+                        if (origParts.Length >= 4 && !origParts[3].Equals(originalNativeLocator, StringComparison.OrdinalIgnoreCase))
+                        {
+                            origParts[3] = originalNativeLocator!.Trim();
+                            templateFallbackNum = string.Join("-", origParts);
+                        }
+                    }
+                    var specific = paramBundle?.GetSheetNumberParams(sheet.SheetNumber, templateFallbackNum);
                     if (specific != null) specificHits++;
 
                     var effective = MergeParams(paramSet, specific);
@@ -3692,7 +3852,10 @@ namespace RevitLocationExporter.Commands
             }
             else
             {
-                log.Warning(locationName, "No 'Naviswork' source view found. Searching for existing export views.");
+                if (exactNwc != null || exactIfc != null)
+                    log.Info(locationName, "Using existing 'Export-NWC' / 'Export-IFC' export view(s).");
+                else
+                    log.Warning(locationName, "No 'Naviswork' source view found. Searching for existing export views.");
 
                 if (exactNwc != null)
                 {
